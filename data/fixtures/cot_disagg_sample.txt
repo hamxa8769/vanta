@@ -1,0 +1,10 @@
+# FIXTURE — hand-made sample in the REAL live CFTC flat-file format
+# (comma-delimited, f_disagg.txt style), values matching the published
+# 2026-11-17 report. Disaggregated futures-only: OI 407834;
+# producer long 20252 / short 24843; swap long 21549 / short 210708 /
+# spreading 35204; managed money long 121994 / short 19052 / spreading
+# 45048 (MM net = +102942); other long 88057 / short 24867 / spreading
+# 28467; total long 360571 / short 388189; non-reportable long 47263 /
+# short 19645.
+"GOLD - COMMODITY EXCHANGE INC.",261117,2026-11-17,088691,CMX ,01,088 ,  407834,   20252,   24843,   21549,  210708,   35204,  121994,   19052,   45048,   88057,   24867,   28467,  360571,  388189,   47263,   19645
+"SILVER - COMMODITY EXCHANGE INC.",261117,2026-11-17,088692,CMX ,01,088 ,  123456,   50000,   40000,    5000,   30000,   35000,   85000,   75000,   38456,   48456

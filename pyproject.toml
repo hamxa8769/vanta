@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vanta"
+version = "0.1.0"
+description = "Vanta — Gold Institutional Analysis Board: standalone shadow/advisory XAUUSD analysis core (SQLite, no live trading)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "GoldBoard" }]
+dependencies = [
+    "requests>=2.32",
+    "PySide6>=6.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+goldboard = "goldboard_core.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,9 @@
+# FIXTURE — hand-made sample in the REAL live CFTC flat-file format
+# (comma-delimited, deafut.txt style), values matching the published
+# 2026-11-17 report so parsers can be tested against real numbers.
+# Legacy futures-only: OI 407834; NC long 210051 / short 43919 /
+# spreading 73515; commercial long 77005 / short 270755;
+# total long 360571 / short 388189; non-reportable long 47263 / short 19645.
+# NC net = +166132.
+"GOLD - COMMODITY EXCHANGE INC.",261117,2026-11-17,088691,CMX ,01,088 ,  407834,  210051,   43919,   73515,   77005,  270755,  360571,  388189,   47263,   19645,  407834,  210051,   43919,   73515,   77005,  270755,  360571,  388189,   47263,   19645
+"SILVER - COMMODITY EXCHANGE INC.",261117,2026-11-17,088692,CMX ,01,088 ,  123456,   50000,   40000,    5000,   30000,   35000,   85000,   75000,   38456,   48456

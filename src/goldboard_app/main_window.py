@@ -1,0 +1,910 @@
+"""Vanta desktop UI (Phase 4) — PySide6/Qt, black + gold, shadow-only.
+
+Single main screen with ten panels (price, score gauge, COT chart, ETF
+flow, central-bank buying, macro, news/sentiment, signals, gates,
+freshness), a live clock, Refresh + auto-refresh on a QTimer, refresh
+in a QThread (never blocks the UI), an in-app updater, threshold
+alerts, and a log drawer.
+
+Honesty rule: every number shows source + timestamp. A failed source
+shows FAILED/STALE — never an invented value. No live trading anywhere.
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDockWidget,
+    QGroupBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStatusBar,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+from goldboard_core.branding import (
+    APP_DISPLAY_NAME,
+    LOGO_DIR,
+    PALETTE,
+    get_app_icon_path,
+)
+from goldboard_core.config import load_config
+from goldboard_core.gates import GATE_THRESHOLDS
+from goldboard_data.fedwatch import load_fomc_calendar, next_meetings
+
+from . import __version__
+from .updater import (
+    NO_CHANNEL_MESSAGE,
+    check_for_update_live,
+    download_asset,
+    fetch_expected_sha256,
+    install_update,
+)
+from .worker import FRESHNESS_SOURCES, RefreshWorker, collect_dashboard_data
+
+# Status colours are functional (ok / stale / failed), not brand colours;
+# every brand surface uses PALETTE from branding.py.
+STATUS_COLORS = {"ok": "#2E9E5B", "stale": "#C77E2A", "failed": "#C0392B"}
+
+IMF_HOLDINGS_NOTE = "IMF holds 2,814.1t — it does not trade gold (not a flow)."
+
+
+
+def _font(size: int, bold: bool = False) -> QFont:
+    """Default-family font. Never pass an empty family to QFont: on some
+    Linux font sets Qt resolves "" to the first family alphabetically,
+    which can be a TeX math font with no digits (clock rendered as
+    garbage glyphs)."""
+    font = QFont()
+    font.setPointSize(size)
+    font.setBold(bold)
+    return font
+
+def resource_path(relative: str | Path) -> Path:
+    """Resolve a repo-relative path, including inside a PyInstaller bundle."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    return base / relative
+
+
+def _fmt_value(value: float | None, unit: str = "", digits: int = 2) -> str:
+    if value is None:
+        return "—"
+    text = f"{value:,.{digits}f}"
+    return f"{text} {unit}".strip() if unit else text
+
+
+def _fmt_time(value: datetime | str | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, str):
+        return value[:19].replace("T", " ")
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _snapshot_line(snap, label: str = "") -> str:
+    """One line for a snapshot: value + source + timestamp, or NO DATA."""
+    if snap is None:
+        return f"{label}: no data yet".strip(": ")
+    status = "" if snap.status == "ok" else f" [{snap.status.upper()}]"
+    proxy = " (proxy)" if getattr(snap, "is_proxy", False) else ""
+    stamp = _fmt_time(snap.fetched_at or snap.as_of)
+    prefix = f"{label}: " if label else ""
+    return (
+        f"{prefix}{_fmt_value(snap.value, snap.unit)}"
+        f" · {snap.source}{status}{proxy} · {stamp}"
+    )
+
+
+# ------------------------------------------------------------------ widgets
+
+class ScoreGauge(QWidget):
+    """Horizontal -100..+100 gauge with a marker at the total score."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._value: float | None = None
+        self.setMinimumHeight(76)
+
+    def set_value(self, value: float | None) -> None:
+        self._value = value
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width, height = self.width(), self.height()
+        bar_y, bar_h = 22, 18
+        # Track: bearish (left) → neutral → bullish (right, gold).
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#3A3A3C"))
+        painter.drawRoundedRect(0, bar_y, width // 2, bar_h, 4, 4)
+        painter.setBrush(QColor(PALETTE["gold"]))
+        painter.drawRoundedRect(width // 2, bar_y, width // 2, bar_h, 4, 4)
+        painter.setPen(QColor(PALETTE["muted"]))
+        painter.drawText(0, 2, 40, 12, Qt.AlignLeft, "-100")
+        painter.drawText(width // 2 - 20, 2, 40, 12, Qt.AlignCenter, "0")
+        painter.drawText(width - 40, 2, 40, 12, Qt.AlignRight, "+100")
+        if self._value is not None:
+            frac = (max(-100.0, min(100.0, self._value)) + 100.0) / 200.0
+            x = int(frac * width)
+            painter.setPen(QPen(QColor(PALETTE["text"]), 2))
+            painter.drawLine(x, bar_y - 6, x, bar_y + bar_h + 6)
+            painter.setPen(QColor(PALETTE["text"]))
+            painter.setFont(_font(11, bold=True))
+            painter.drawText(max(0, min(width - 60, x - 30)), bar_y + bar_h + 4,
+                             60, 16, Qt.AlignCenter, f"{self._value:+.0f}")
+        else:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(0, bar_y + bar_h + 8, width, 16,
+                             Qt.AlignCenter, "no score yet — no data")
+
+
+class CotChart(QWidget):
+    """Custom-painted managed-money net history (matplotlib-free)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._points: list[dict] = []
+        self.setMinimumHeight(150)
+
+    def set_points(self, points: list[dict]) -> None:
+        self._points = points or []
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width, height = self.width(), self.height()
+        if len(self._points) < 2:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(0, 0, width, height, Qt.AlignCenter,
+                             "No COT history yet — refresh to fetch CFTC data.")
+            return
+        values = [p["value"] for p in self._points]
+        lo, hi = min(values), max(values)
+        span = (hi - lo) or 1.0
+        pad_l, pad_r, pad_t, pad_b = 8, 8, 30, 22
+        plot_w = width - pad_l - pad_r
+        plot_h = height - pad_t - pad_b
+
+        def xy(i: int, v: float) -> tuple[float, float]:
+            x = pad_l + (plot_w * i / (len(values) - 1))
+            y = pad_t + plot_h * (1.0 - (v - lo) / span)
+            return x, y
+
+        # Zero line.
+        if lo < 0 < hi:
+            _, zy = xy(0, 0.0)
+            painter.setPen(QPen(QColor(PALETTE["muted"]), 1, Qt.DashLine))
+            painter.drawLine(pad_l, int(zy), width - pad_r, int(zy))
+        # Gold line through the points.
+        path = QPainterPath()
+        x0, y0 = xy(0, values[0])
+        path.moveTo(x0, y0)
+        for i, v in enumerate(values[1:], start=1):
+            x, y = xy(i, v)
+            path.lineTo(x, y)
+        painter.setPen(QPen(QColor(PALETTE["gold"]), 2))
+        painter.drawPath(path)
+        # Last point.
+        lx, ly = xy(len(values) - 1, values[-1])
+        painter.setBrush(QColor(PALETTE["gold_light"]))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(int(lx) - 4, int(ly) - 4, 8, 8)
+        # Min / max labels.
+        painter.setPen(QColor(PALETTE["muted"]))
+        painter.setFont(_font(9))
+        painter.drawText(pad_l, 4, 200, 12, Qt.AlignLeft, f"max {hi:,.0f}")
+        painter.drawText(pad_l, height - 8, 200, 12, Qt.AlignLeft,
+                         f"min {lo:,.0f}  ·  {len(values)} points")
+
+
+# ------------------------------------------------------------- update threads
+
+class UpdateCheckThread(QThread):
+    """Runs the GitHub release check off the UI thread."""
+
+    done = Signal(object, object)  # (update_dict | None, error | None)
+
+    def __init__(self, current_version: str, parent=None) -> None:
+        super().__init__(parent)
+        self.current_version = current_version
+        self.timeout = 8.0  # bounded so closing the app never hangs on it
+
+    def run(self) -> None:  # noqa: D102 — QThread entry point
+        try:
+            update, error = check_for_update_live(
+                self.current_version, timeout=self.timeout)
+        except Exception as exc:  # pragma: no cover — defensive
+            self.done.emit(None, f"update check failed: {exc!r}")
+            return
+        self.done.emit(update, error)
+
+
+class DownloadThread(QThread):
+    """Downloads + verifies the update zip off the UI thread."""
+
+    done = Signal(object, object)  # (zip_path | None, error | None)
+    progress = Signal(int, int)
+
+    def __init__(self, update: dict, dest: Path, parent=None) -> None:
+        super().__init__(parent)
+        self.update = update
+        self.dest = dest
+
+    def run(self) -> None:  # noqa: D102 — QThread entry point
+        try:
+            expected = None
+            if self.update.get("sha256_asset_url"):
+                expected = fetch_expected_sha256(self.update["sha256_asset_url"])
+            path = download_asset(
+                self.update["asset_url"], self.dest,
+                expected_sha256=expected,
+                progress_cb=lambda done, total: self.progress.emit(done, total),
+            )
+        except Exception as exc:
+            self.done.emit(None, str(exc))
+            return
+        self.done.emit(str(path), None)
+
+
+# --------------------------------------------------------------- main window
+
+class MainWindow(QMainWindow):
+    """Vanta main window — one screen, ten panels, black + gold."""
+
+    def __init__(self, db_path: str | Path | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.config = load_config()
+        self.db_path = Path(db_path) if db_path else Path(self.config.db_path)
+        self.settings = QSettings("Vanta", "GoldBoard")
+        self._last_signal_direction: str | None = None
+        self._last_total: float | None = None
+        self._pending_update: dict | None = None
+        self._worker: RefreshWorker | None = None
+        self._update_thread: UpdateCheckThread | None = None
+        self._download_thread: DownloadThread | None = None
+
+        self.setWindowTitle(f"{APP_DISPLAY_NAME} — Gold Institutional Analysis Board")
+        icon_path = get_app_icon_path()
+        if icon_path is not None:
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self.resize(1400, 950)
+        self.setStyleSheet(self._stylesheet())
+
+        self._build_header()
+        self._build_panels()
+        self._build_log_drawer()
+        self.setStatusBar(QStatusBar(self))
+        self.statusBar().showMessage("Ready — shadow mode only, no live trading.")
+
+        # Live clock.
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(1000)
+        self._tick_clock()
+
+        # Auto-refresh.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self.start_refresh)
+        self._apply_refresh_interval()
+
+        # Tray icon (alerts surface here when available).
+        self._tray: QSystemTrayIcon | None = None
+        if QSystemTrayIcon.isSystemTrayAvailable() and icon_path is not None:
+            self._tray = QSystemTrayIcon(QIcon(str(icon_path)), self)
+            self._tray.show()
+
+        # First paint from the local DB (fast, no network), then refresh.
+        self._apply_payload(collect_dashboard_data(self.db_path, refresh=False))
+        self.log("Vanta started — loaded from local DB; starting refresh.")
+        QTimer.singleShot(500, self.start_refresh)
+        QTimer.singleShot(2000, self.check_for_updates)
+
+    # ------------------------------------------------------------------ style
+
+    def _stylesheet(self) -> str:
+        return f"""
+        QMainWindow, QWidget {{ background-color: {PALETTE["black"]};
+            color: {PALETTE["text"]}; font-size: 13px; }}
+        QGroupBox {{ border: 1px solid {PALETTE["gold"]}; border-radius: 6px;
+            margin-top: 12px; padding: 10px; background: {PALETTE["surface"]}; }}
+        QGroupBox::title {{ color: {PALETTE["gold"]}; subcontrol-origin: margin;
+            left: 8px; padding: 0 4px; font-weight: bold; }}
+        QLabel {{ color: {PALETTE["text"]}; background: transparent; }}
+        QLabel.muted {{ color: {PALETTE["muted"]}; }}
+        QPushButton {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
+            border: none; border-radius: 4px; padding: 6px 14px; font-weight: bold; }}
+        QPushButton:hover {{ background: {PALETTE["gold_light"]}; }}
+        QPushButton:disabled {{ background: #3A3A3C; color: {PALETTE["muted"]}; }}
+        QPushButton.ghost {{ background: transparent; color: {PALETTE["gold"]};
+            border: 1px solid {PALETTE["gold"]}; }}
+        QSpinBox {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
+            border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 3px; }}
+        QListWidget {{ background: {PALETTE["black"]};
+            border: 1px solid {PALETTE["gold"]}; border-radius: 4px; }}
+        QPlainTextEdit {{ background: {PALETTE["black"]};
+            color: {PALETTE["text"]}; border: 1px solid {PALETTE["gold"]}; }}
+        QScrollArea {{ border: none; }}
+        """
+
+    # ------------------------------------------------------------------ build
+
+    def _build_header(self) -> None:
+        header = QWidget(self)
+        layout = QHBoxLayout(header)
+        logo_path = resource_path("assets/logo/vanta-logo.png")
+        if not logo_path.is_file():
+            from goldboard_core.branding import get_app_logo_path
+            logo_path = get_app_logo_path()
+        logo = QLabel(header)
+        if logo_path is not None and Path(logo_path).is_file():
+            pix = QPixmap(str(logo_path)).scaled(
+                44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo.setPixmap(pix)
+        else:
+            logo.setText("◆")
+            logo.setStyleSheet(f"color: {PALETTE['gold']}; font-size: 28px;")
+        layout.addWidget(logo)
+        title = QLabel(f"{APP_DISPLAY_NAME}", header)
+        title.setFont(_font(20, bold=True))
+        title.setStyleSheet(f"color: {PALETTE['gold']};")
+        layout.addWidget(title)
+        version = QLabel(f"v{__version__} · shadow mode — no live trading", header)
+        version.setProperty("class", "muted")
+        layout.addWidget(version)
+        layout.addStretch(1)
+        self._clock_label = QLabel(header)
+        self._clock_label.setFont(_font(11))
+        layout.addWidget(self._clock_label)
+        self._update_button = QPushButton("Update available", header)
+        self._update_button.setVisible(False)
+        self._update_button.clicked.connect(self._on_update_button)
+        layout.addWidget(self._update_button)
+        self._alerts_check = QCheckBox("Signal alerts", header)
+        self._alerts_check.setChecked(
+            self.settings.value("alerts_enabled", True, type=bool))
+        layout.addWidget(self._alerts_check)
+        layout.addWidget(QLabel("Auto-refresh (min):", header))
+        self._interval_spin = QSpinBox(header)
+        self._interval_spin.setRange(5, 1440)
+        self._interval_spin.setValue(
+            self.settings.value("auto_refresh_minutes", 15, type=int))
+        self._interval_spin.valueChanged.connect(self._on_interval_changed)
+        layout.addWidget(self._interval_spin)
+        self._refresh_button = QPushButton("Refresh", header)
+        self._refresh_button.clicked.connect(self.start_refresh)
+        layout.addWidget(self._refresh_button)
+        self._header = header
+
+    def _panel(self, title: str) -> tuple[QGroupBox, QVBoxLayout]:
+        box = QGroupBox(title, self)
+        layout = QVBoxLayout(box)
+        return box, layout
+
+    def _build_panels(self) -> None:
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        content = QWidget(scroll)
+        grid = QGridLayout(content)
+
+        # (1) Gold price.
+        box, layout = self._panel("Gold price (XAUUSD)")
+        self._price_value = QLabel("—", content)
+        self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._price_value.setFont(_font(22, bold=True))
+        self._price_value.setStyleSheet(f"color: {PALETTE['gold_light']};")
+        self._price_change = QLabel("—", content)
+        self._price_change.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._price_source = QLabel("No data yet.", content)
+        self._price_source.setProperty("class", "muted")
+        self._price_source.setWordWrap(True)
+        self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._price_value)
+        layout.addWidget(self._price_change)
+        layout.addWidget(self._price_source)
+        layout.addStretch(1)
+        grid.addWidget(box, 0, 0)
+
+        # (2) Total score gauge + components.
+        box, layout = self._panel("Total score")
+        self._gauge = ScoreGauge(content)
+        self._score_value = QLabel("No score yet — no data.", content)
+        self._score_value.setFont(_font(14, bold=True))
+        self._components_list = QListWidget(content)
+        self._components_list.setWordWrap(True)
+        self._components_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._components_list.setMinimumHeight(120)
+        layout.addWidget(self._gauge)
+        layout.addWidget(self._score_value)
+        layout.addWidget(self._components_list)
+        grid.addWidget(box, 0, 1)
+
+        # (3) COT chart.
+        box, layout = self._panel("COT — managed-money net (contracts)")
+        self._cot_chart = CotChart(content)
+        self._cot_summary = QLabel("No COT data yet.", content)
+        self._cot_summary.setWordWrap(True)
+        self._cot_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._cot_chart)
+        layout.addWidget(self._cot_summary)
+        grid.addWidget(box, 0, 2)
+
+        # (4) ETF flow.
+        box, layout = self._panel("ETF flow — GLD / IAU")
+        self._etf_label = QLabel("No ETF data yet.", content)
+        self._etf_label.setWordWrap(True)
+        self._etf_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._etf_label)
+        layout.addStretch(1)
+        grid.addWidget(box, 1, 0)
+
+        # (5) Central-bank buying.
+        box, layout = self._panel("Central-bank buying")
+        self._cb_label = QLabel("No central-bank data yet.", content)
+        self._cb_label.setWordWrap(True)
+        note = QLabel(IMF_HOLDINGS_NOTE, content)
+        note.setProperty("class", "muted")
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._cb_label)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        grid.addWidget(box, 1, 1)
+
+        # (6) Macro.
+        box, layout = self._panel("Macro — rates / USD / Fed")
+        self._macro_label = QLabel("No macro data yet.", content)
+        self._macro_label.setWordWrap(True)
+        self._macro_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._macro_label)
+        layout.addStretch(1)
+        grid.addWidget(box, 1, 2)
+
+        # (7) News / sentiment.
+        box, layout = self._panel("News & sentiment")
+        self._news_label = QLabel("No news data yet.", content)
+        self._news_label.setWordWrap(True)
+        self._news_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self._news_label)
+        layout.addStretch(1)
+        grid.addWidget(box, 2, 0)
+
+        # (8) Signals.
+        box, layout = self._panel("Signals (advisory, shadow only)")
+        self._signal_label = QLabel("No signal yet — no data.", content)
+        self._signal_label.setWordWrap(True)
+        self._signal_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._signal_list = QListWidget(content)
+        self._signal_list.setWordWrap(True)
+        self._signal_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._signal_list.setMinimumHeight(120)
+        layout.addWidget(self._signal_label)
+        layout.addWidget(self._signal_list)
+        grid.addWidget(box, 2, 1)
+
+        # (9) Gates.
+        box, layout = self._panel("Validation gates G0–G8")
+        self._gates_banner = QLabel("NOT ready for Muuk integration", content)
+        self._gates_banner.setWordWrap(True)
+        self._gates_banner.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._gates_banner.setFont(_font(12, bold=True))
+        self._gates_list = QListWidget(content)
+        self._gates_list.setWordWrap(True)
+        self._gates_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._gates_list.setMinimumHeight(120)
+        layout.addWidget(self._gates_banner)
+        layout.addWidget(self._gates_list)
+        grid.addWidget(box, 2, 2)
+
+        # (10) Data freshness.
+        box, layout = self._panel("Data freshness")
+        self._freshness_list = QListWidget(content)
+        self._freshness_list.setWordWrap(True)
+        self._freshness_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._freshness_list.setMinimumHeight(150)
+        layout.addWidget(self._freshness_list)
+        grid.addWidget(box, 3, 0, 1, 3)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        content.setLayout(grid)
+        scroll.setWidget(content)
+
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.addWidget(self._header)
+        central_layout.addWidget(scroll)
+        central_layout.setContentsMargins(8, 4, 8, 4)
+        self.setCentralWidget(central)
+
+    def _build_log_drawer(self) -> None:
+        dock = QDockWidget("Logs", self)
+        dock.setAllowedAreas(Qt.BottomDockWidgetArea)
+        self._log_view = QPlainTextEdit(dock)
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(500)
+        dock.setWidget(self._log_view)
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self._log_dock = dock
+        # Keep the log drawer slim by default so all ten panels stay
+        # visible; the user can drag it taller or close it.
+        self.resizeDocks([dock], [130], Qt.Vertical)
+
+    # ------------------------------------------------------------------ clock
+
+    def _tick_clock(self) -> None:
+        self._clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def log(self, message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._log_view.appendPlainText(f"[{stamp}] {message}")
+
+    # ---------------------------------------------------------------- refresh
+
+    def _on_interval_changed(self, minutes: int) -> None:
+        self.settings.setValue("auto_refresh_minutes", minutes)
+        self._apply_refresh_interval()
+        self.log(f"Auto-refresh set to every {minutes} min.")
+
+    def _apply_refresh_interval(self) -> None:
+        minutes = self.settings.value("auto_refresh_minutes", 15, type=int)
+        self._refresh_timer.setInterval(max(1, minutes) * 60 * 1000)
+
+    def start_refresh(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._refresh_button.setEnabled(False)
+        self.statusBar().showMessage("Refreshing…")
+        self._worker = RefreshWorker(str(self.db_path), self)
+        self._worker.finished.connect(self._on_refresh_finished)
+        self._worker.failed.connect(self._on_refresh_failed)
+        self._worker.start()
+
+    def _on_refresh_finished(self, payload: dict) -> None:
+        self._refresh_button.setEnabled(True)
+        self._apply_payload(payload)
+        for error in payload.get("errors", []):
+            self.log(f"ERROR: {error}")
+        self.statusBar().showMessage(
+            f"Refreshed at {payload.get('refreshed_at', '')[:19]} "
+            f"· shadow mode only, no live trading.")
+        self.log("Refresh finished.")
+
+    def _on_refresh_failed(self, message: str) -> None:
+        self._refresh_button.setEnabled(True)
+        self.statusBar().showMessage(f"Refresh failed: {message}")
+        self.log(f"ERROR: {message}")
+
+    # ----------------------------------------------------------------- payload
+
+    def _apply_payload(self, payload: dict) -> None:
+        snaps = payload.get("snapshots", {})
+
+        # (1) Price.
+        price = payload.get("price")
+        if price is not None:
+            self._price_value.setText(_fmt_value(price.value, price.unit))
+            history = payload.get("price_history", [])
+            if len(history) >= 2:
+                prev = history[-2]["value"]
+                change = price.value - prev
+                pct = (change / prev * 100.0) if prev else 0.0
+                sign = "+" if change >= 0 else ""
+                self._price_change.setText(
+                    f"{sign}{change:,.2f} ({sign}{pct:.2f}%) vs previous stored quote")
+            else:
+                self._price_change.setText("Change: — (only one stored quote)")
+            self._price_source.setText(_snapshot_line(price, "Source"))
+        else:
+            self._price_value.setText("—")
+            self._price_change.setText("Change: —")
+            self._price_source.setText(
+                "No price yet — refresh to fetch the Yahoo quote (proxy).")
+
+        # (2) Score + components.
+        score = payload.get("score")
+        self._components_list.clear()
+        if score is not None:
+            self._gauge.set_value(score.total)
+            self._score_value.setText(f"Total: {score.total:+.1f} / ±100")
+            for comp in score.components:
+                item = QListWidgetItem(
+                    f"{comp.name}: {comp.score:+.0f} "
+                    f"(weight {comp.weight:.0%}) — {comp.reason}")
+                self._components_list.addItem(item)
+            for reason in score.reasons:
+                self._components_list.addItem(QListWidgetItem(f"• {reason}"))
+        else:
+            self._gauge.set_value(None)
+            self._score_value.setText("No score yet — no data.")
+            self._components_list.addItem(
+                QListWidgetItem("No pillars have data yet."))
+
+        # (3) COT chart.
+        cot_history = payload.get("cot_history", [])
+        self._cot_chart.set_points(cot_history)
+        mm_net = snaps.get("cot_gold_mm_net")
+        mm_pct = snaps.get("cot_gold_mm_net_pct_oi")
+        pctile = snaps.get("cot_managed_money_net_pctile_52w")
+        lines = []
+        if mm_net is not None:
+            lines.append(_snapshot_line(mm_net, "Managed-money net"))
+        if mm_pct is not None:
+            lines.append(_snapshot_line(mm_pct, "Net as % of OI"))
+        if pctile is not None:
+            lines.append(_snapshot_line(pctile, "52-week percentile"))
+        elif cot_history:
+            values = sorted(p["value"] for p in cot_history)
+            latest = cot_history[-1]["value"]
+            rank = sum(1 for v in values if v <= latest) / len(values) * 100.0
+            lines.append(f"52-week percentile (from stored history): {rank:.0f}%")
+        self._cot_summary.setText("\n".join(lines) if lines else "No COT data yet.")
+
+        # (4) ETF flow.
+        etf_lines = [
+            _snapshot_line(snaps.get("etf_gld_tonnes"), "GLD holdings"),
+            _snapshot_line(snaps.get("etf_gld_daily_change_tonnes"), "GLD daily change"),
+            _snapshot_line(snaps.get("etf_iau_tonnes"), "IAU holdings"),
+            _snapshot_line(snaps.get("etf_iau_daily_change_tonnes"), "IAU daily change"),
+        ]
+        self._etf_label.setText("\n".join(etf_lines))
+
+        # (5) Central-bank buying.
+        cb_lines = [
+            _snapshot_line(snaps.get("wgc_cb_net_tonnes"), "Net buying (latest)"),
+            _snapshot_line(snaps.get("central_bank_net_tonnes_3m"), "Net buying (3m)"),
+        ]
+        self._cb_label.setText("\n".join(cb_lines))
+
+        # (6) Macro.
+        macro_lines = [
+            _snapshot_line(snaps.get("fred_dfii10"), "US 10y real yield (DFII10)"),
+            _snapshot_line(snaps.get("fred_dtwexbgs"), "Broad USD index (DTWEXBGS)"),
+            _snapshot_line(snaps.get("fred_dgs10"), "US 10y nominal (DGS10)"),
+            _snapshot_line(snaps.get("fred_sofr"), "SOFR"),
+        ]
+        try:
+            calendar = load_fomc_calendar()
+            target = calendar.get("fed_funds_target", "—")
+            macro_lines.append(f"Fed funds target: {target} (manual calendar)")
+            upcoming = next_meetings()
+            if upcoming:
+                nxt = upcoming[0]
+                macro_lines.append(
+                    f"Next FOMC: {nxt.get('start')} – {nxt.get('end')}")
+            else:
+                macro_lines.append("Next FOMC: none in calendar")
+        except Exception as exc:
+            macro_lines.append(f"FOMC calendar unavailable: {exc}")
+        self._macro_label.setText("\n".join(macro_lines))
+
+        # (7) News / sentiment.
+        news_lines = [
+            _snapshot_line(snaps.get("gdelt_gold_tone_latest"), "GDELT gold tone"),
+            _snapshot_line(snaps.get("gdelt_gold_tone_7d_avg"), "GDELT tone 7d avg"),
+            _snapshot_line(snaps.get("gdelt_gold_mentions_latest"), "GDELT mentions"),
+        ]
+        if self.config.finnhub_api_key:
+            news_lines.append(_snapshot_line(
+                snaps.get("finnhub_gld_bullish_pct"), "Finnhub GLD bullish %"))
+            news_lines.append(_snapshot_line(
+                snaps.get("finnhub_gold_news_count"), "Finnhub gold news count"))
+        else:
+            news_lines.append(
+                "Finnhub: key required — set GOLD_BOARD_FINNHUB_KEY to enable.")
+        self._news_label.setText("\n".join(news_lines))
+
+        # (8) Signals.
+        signal = payload.get("signal")
+        if signal is not None:
+            direction = signal.direction.upper()
+            self._signal_label.setText(
+                f"Latest: {direction} @ {_fmt_value(signal.entry, 'USD/oz')} · "
+                f"SL {_fmt_value(signal.sl)} · TP {_fmt_value(signal.tp)} · "
+                f"confidence {signal.confidence:.0%} · "
+                f"{_fmt_time(signal.generated_at)}\n{signal.reason}")
+        else:
+            self._signal_label.setText("No signal yet — no data.")
+        self._signal_list.clear()
+        for past in payload.get("signals_history", [])[:20]:
+            self._signal_list.addItem(QListWidgetItem(
+                f"{_fmt_time(past.generated_at)} — {past.direction.upper()} @ "
+                f"{_fmt_value(past.entry)} · {past.status} · {past.reason}"))
+
+        # (9) Gates.
+        gates = payload.get("gates", [])
+        self._gates_list.clear()
+        for gate in gates:
+            mark = "PASS" if gate.passed else "FAIL"
+            threshold = GATE_THRESHOLDS.get(gate.name, gate.threshold or "")
+            self._gates_list.addItem(QListWidgetItem(
+                f"{gate.name} [{mark}] — {gate.detail} ({threshold})"))
+        ready = payload.get("ready_for_muuk", False)
+        if ready:
+            self._gates_banner.setText("Ready for Muuk integration")
+            self._gates_banner.setStyleSheet(f"color: {STATUS_COLORS['ok']};")
+        else:
+            self._gates_banner.setText("NOT ready for Muuk integration")
+            self._gates_banner.setStyleSheet(f"color: {STATUS_COLORS['failed']};")
+
+        # (10) Freshness.
+        self._freshness_list.clear()
+        freshness = payload.get("freshness", {})
+        for source in FRESHNESS_SOURCES:
+            entry = freshness.get(source, {})
+            status = str(entry.get("status") or "failed").lower()
+            color = STATUS_COLORS.get(status, STATUS_COLORS["failed"])
+            stamp = _fmt_time(entry.get("fetched_at"))
+            error = entry.get("error")
+            text = f"{source}: {status.upper()} · last fetch {stamp}"
+            if error:
+                text += f" · {error}"
+            item = QListWidgetItem(text)
+            item.setForeground(QColor(color))
+            self._freshness_list.addItem(item)
+
+        self._check_alerts(payload)
+
+    # ------------------------------------------------------------------ alerts
+
+    def _check_alerts(self, payload: dict) -> None:
+        if not self._alerts_check.isChecked():
+            return
+        signal = payload.get("signal")
+        score = payload.get("score")
+        messages: list[str] = []
+        if signal is not None and signal.direction != "none":
+            if self._last_signal_direction != signal.direction:
+                messages.append(
+                    f"ALERT: new {signal.direction.upper()} signal @ "
+                    f"{_fmt_value(signal.entry, 'USD/oz')} "
+                    f"(confidence {signal.confidence:.0%})")
+            self._last_signal_direction = signal.direction
+        if score is not None:
+            threshold = 40.0
+            if (self._last_total is None or abs(self._last_total) < threshold) \
+                    and abs(score.total) >= threshold:
+                messages.append(
+                    f"ALERT: total score crossed ±{threshold:.0f} "
+                    f"(now {score.total:+.1f})")
+            self._last_total = score.total
+        for message in messages:
+            self.log(message)
+            self.statusBar().showMessage(message)
+            if self._tray is not None:
+                self._tray.showMessage(
+                    APP_DISPLAY_NAME, message,
+                    QSystemTrayIcon.Information, 8000)
+
+    # ----------------------------------------------------------------- updater
+
+    def check_for_updates(self) -> None:
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+        self._update_thread = UpdateCheckThread(__version__, self)
+        self._update_thread.done.connect(self._on_update_checked)
+        self._update_thread.start()
+
+    def _on_update_checked(self, update: dict | None, error: str | None) -> None:
+        if error is not None:
+            if NO_CHANNEL_MESSAGE in error:
+                self.log("Updater: no release channel yet "
+                         "(GitHub repo hamxa8769/vanta not created).")
+                self.statusBar().showMessage(
+                    "No release channel yet — repo hamxa8769/vanta not created.")
+            else:
+                self.log(f"Updater: {error}")
+            return
+        if update is None:
+            self.log("Updater: no newer release available.")
+            return
+        self._pending_update = update
+        self._update_button.setText(f"Update available: v{update['version']}")
+        self._update_button.setVisible(True)
+        self.log(f"Updater: v{update['version']} available "
+                 f"({update.get('html_url') or ''}).")
+        self.statusBar().showMessage(
+            f"Update available: v{update['version']} — click the header button.")
+
+    def _on_update_button(self) -> None:
+        update = self._pending_update
+        if update is None:
+            return
+        if not update.get("asset_url"):
+            QMessageBox.information(
+                self, "Update",
+                f"v{update['version']} is published but has no Windows "
+                f"download attached yet. See {update.get('html_url') or ''}.")
+            return
+        answer = QMessageBox.question(
+            self, "Update available",
+            f"Download and install Vanta v{update['version']}?\n"
+            "Your config is preserved (it lives outside the install folder).")
+        if answer != QMessageBox.Yes:
+            return
+        self._update_button.setEnabled(False)
+        self._update_button.setText("Downloading update…")
+        dest = Path.home() / "Downloads" / (update.get("asset_name") or "Vanta-update.zip")
+        self._download_thread = DownloadThread(update, dest, self)
+        self._download_thread.progress.connect(self._on_download_progress)
+        self._download_thread.done.connect(self._on_download_done)
+        self._download_thread.start()
+
+    def _on_download_progress(self, done: int, total: int) -> None:
+        if total:
+            self.statusBar().showMessage(
+                f"Downloading update… {done / 1024 / 1024:.1f} / "
+                f"{total / 1024 / 1024:.1f} MB")
+
+    def _on_download_done(self, zip_path: str | None, error: str | None) -> None:
+        self._update_button.setEnabled(True)
+        if error is not None or zip_path is None:
+            self.log(f"Updater: download failed — {error}")
+            self.statusBar().showMessage(f"Update download failed: {error}")
+            self._update_button.setText("Update available")
+            return
+        answer = QMessageBox.question(
+            self, "Update downloaded",
+            "The update is downloaded and verified. Install now?\n"
+            "Vanta will close and restart on the new version.")
+        if answer != QMessageBox.Yes:
+            self._update_button.setText("Update available")
+            return
+        try:
+            install_update(zip_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Update failed", str(exc))
+            self.log(f"Updater: install failed — {exc}")
+            return
+        self.log("Updater: installing — closing Vanta for the update.")
+        # Close (not just quit): closeEvent waits for background threads
+        # so no QThread is destroyed while still running.
+        self.close()
+        QApplication.quit()
+
+    # ------------------------------------------------------------------- close
+
+    def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
+        self._clock_timer.stop()
+        self._refresh_timer.stop()
+        # Wait for background threads: destroying a running QThread aborts
+        # the process, so bound the waits (update check timeout is 8s).
+        # The refresh worker has no cooperative stop flag (its run() is a
+        # straight registry -> score -> signal pass), so it gets the
+        # longest wait; terminate() is the last resort at shutdown only —
+        # its DB writes are single atomic SQLite transactions.
+        for thread, wait_ms in (
+            (self._worker, 15000),
+            (self._update_thread, 9000),
+            (self._download_thread, 3000),
+        ):
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                if not thread.wait(wait_ms):
+                    # Last resort: a stuck download is idempotent (the
+                    # partial file is simply left behind), and a stuck
+                    # refresh only loses one score/gate write, so it is
+                    # safe to terminate rather than abort the process.
+                    thread.terminate()
+                    thread.wait(1000)
+        super().closeEvent(event)
