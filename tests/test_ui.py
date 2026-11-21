@@ -275,3 +275,29 @@ def test_live_price_worker_emits_ticks(tmp_path, monkeypatch, qapp):
     worker.wait(3000)
     assert len(ticks) >= 1
     assert ticks[0]["value"] == pytest.approx(3515.4)
+
+
+def test_no_refresh_starts_after_window_close(tmp_path, monkeypatch, qapp):
+    """Regression: closing the window must cancel the pending 500ms
+    startup refresh — a static singleShot fired after close and left
+    an ownerless live refresh running (Windows CI exited 1 on it
+    even though all 178 tests had passed)."""
+    from PySide6.QtTest import QTest
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "goldboard_app.worker.refresh_all",
+        lambda db_path: calls.append(db_path) or {})
+    monkeypatch.setattr("goldboard_app.worker._fetch_history", lambda *a: None)
+    monkeypatch.setattr("goldboard_app.worker._fetch_news", lambda *a: None)
+    db = tmp_path / "goldboard.db"
+    _seed_db(db)
+    window = MainWindow(db_path=db, enable_live_ticker=False)
+    window.show()
+    qapp.processEvents()
+    window.close()
+    qapp.processEvents()
+    # Wait past the 500ms startup timer (and the 1s ticker timer).
+    QTest.qWait(1500)
+    qapp.processEvents()
+    assert calls == []

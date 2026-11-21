@@ -646,10 +646,25 @@ class MainWindow(QMainWindow):
         # First paint from the local DB (fast, no network), then refresh.
         self._apply_payload(collect_dashboard_data(self.db_path, refresh=False))
         self.log("Vanta started — loaded from local DB; starting refresh.")
-        QTimer.singleShot(500, self.start_refresh)
-        QTimer.singleShot(2000, self.check_for_updates)
+        # Startup timers are members (not static singleShot): closeEvent
+        # stops them, so no refresh/update/ticker can start after the
+        # window closes — a static singleShot would fire anyway and leave
+        # an ownerless thread running (Windows CI exited 1 on exactly
+        # that: orphaned live refresh after the tests had all passed).
+        self._closed = False
+        self._startup_refresh_timer = QTimer(self)
+        self._startup_refresh_timer.setSingleShot(True)
+        self._startup_refresh_timer.timeout.connect(self.start_refresh)
+        self._startup_refresh_timer.start(500)
+        self._startup_update_timer = QTimer(self)
+        self._startup_update_timer.setSingleShot(True)
+        self._startup_update_timer.timeout.connect(self.check_for_updates)
+        self._startup_update_timer.start(2000)
         # Live price ticker (header price ticks every N seconds).
-        QTimer.singleShot(1000, self._start_ticker)
+        self._startup_ticker_timer = QTimer(self)
+        self._startup_ticker_timer.setSingleShot(True)
+        self._startup_ticker_timer.timeout.connect(self._start_ticker)
+        self._startup_ticker_timer.start(1000)
 
     # ------------------------------------------------------------------ style
 
@@ -967,7 +982,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Settings saved — keys apply on the next refresh.")
         # Keys changed: refresh now so the new sources show up.
-        QTimer.singleShot(500, self.start_refresh)
+        self._startup_refresh_timer.start(500)
 
     # ------------------------------------------------------------ live ticker
 
@@ -1095,6 +1110,8 @@ class MainWindow(QMainWindow):
         self.log(f"ERROR: {message}")
 
     def start_refresh(self) -> None:
+        if getattr(self, "_closed", False):
+            return
         if self._worker is not None and self._worker.isRunning():
             return
         self._refresh_button.setEnabled(False)
@@ -1437,8 +1454,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------- close
 
     def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
+        self._closed = True
         self._clock_timer.stop()
         self._refresh_timer.stop()
+        # Stop the startup timers first: a pending refresh/update/ticker
+        # must never start after close (ownerless background thread).
+        for timer in (self._startup_refresh_timer,
+                      self._startup_update_timer,
+                      self._startup_ticker_timer):
+            timer.stop()
         if self._ticker is not None and self._ticker.isRunning():
             self._ticker.stop()
             self._ticker.wait(2000)
