@@ -683,6 +683,11 @@ class MainWindow(QMainWindow):
             _snapshot_line(snaps.get("fred_dgs10"), "US 10y nominal (DGS10)"),
             _snapshot_line(snaps.get("fred_sofr"), "SOFR"),
         ]
+        if not self.config.fred_api_key:
+            macro_lines.append(
+                "FRED: no key set — macro data uses the slow fredgraph.csv "
+                "fallback; a free key (GOLD_BOARD_FRED_KEY, "
+                "fred.stlouisfed.org) makes it fast.")
         try:
             calendar = load_fomc_calendar()
             target = calendar.get("fed_funds_target", "—")

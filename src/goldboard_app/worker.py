@@ -5,11 +5,12 @@ unit-testable: refresh every connector via the registry, then score
 and signal from the DB. ``RefreshWorker`` runs it on a QThread so the
 UI never blocks on network I/O.
 
-Note (Phase 2): ``registry.refresh_all()`` returns a per-source status
-report and does not itself persist snapshots — persistence belongs to
-the connectors/storage layer. The score/signal therefore always come
-from the DB (whatever is stored there), and a source whose connector
-failed is shown as FAILED/STALE, never with an invented value.
+Note: ``registry.refresh_all(db_path)`` persists every fetched
+snapshot to the DB (v0.1.2 fix — before that it stored nothing and
+the dashboard always showed "no data yet"). The score/signal
+therefore always come from the DB (whatever is stored there), and a
+source whose connector failed is shown as FAILED/STALE, never with
+an invented value.
 """
 
 from __future__ import annotations

@@ -150,18 +150,20 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.1.1**. Every release bumps the
+carry the same version. Current: **0.1.2**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
 
-v0.1.1 fixes the v0.1.0 launch crash (the PyInstaller entry script did
-a relative import with no parent package) and the in-app updater's zip
-extraction (the release zip wraps files in a top-level `Vanta/`
-folder, so it must extract into the install dir's parent — extracting
-into the install dir itself nested `Vanta/Vanta/` and never replaced
-the running exe). The updater itself (startup check + "Update
-available" button + download + SHA-256 verify + update.bat restart)
-was already in the app; it just never got to run because v0.1.0
-crashed on launch.
+v0.1.2 makes the board actually functional: v0.1.1 fetched data but
+never stored it, so every panel stayed on "no data yet" — `refresh_all`
+now persists every fetched snapshot to the DB. Refresh also runs
+connectors in parallel (sequential refresh never finished in 280s
+when fredgraph.csv stalled) and the FOMC calendar file is bundled
+into the frozen app (it was missing, so the macro panel said
+"data/fomc_calendar.json not found"). Live check 2026-11-21: 7/12
+sources OK (price, COT, ETF, central-bank, COMEX, LBMA,
+microstructure); FedWatch/Finnhub need keys by design, FRED's CSV
+fallback stalls from here (a free FRED key uses the fast JSON API),
+GDELT rate-limits, USGS supply page parse fails.
 
 ## Not yet built (TODO — later phases own these)
 

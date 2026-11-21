@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,7 +34,20 @@ KEY_REQUIRED_MSG = ("FedWatch API key required ($25/mo EOD API) — set "
 
 def _calendar_paths() -> list[Path]:
     here = Path(__file__).resolve()
-    return [
+    paths: list[Path] = []
+    # Frozen app (PyInstaller): the calendar is bundled as data/ next
+    # to the exe (vanta.spec datas); _MEIPASS is the bundle dir.
+    # Without this, the frozen app never finds the file (v0.1.1 bug:
+    # "FOMC calendar unavailable: data/fomc_calendar.json not found").
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        # PyInstaller 6 onedir: datas live under _internal/ and
+        # _MEIPASS is the _internal dir itself; older/onefile layouts
+        # put them directly under _MEIPASS — try both, plus the
+        # bundle-root _internal variant, before the dev paths.
+        paths.append(Path(meipass) / "data" / "fomc_calendar.json")
+        paths.append(Path(meipass) / "_internal" / "data" / "fomc_calendar.json")
+    return paths + [
         here.parents[2] / "data" / "fomc_calendar.json",   # gold-board/data/
         Path.cwd() / "data" / "fomc_calendar.json",
         here.parents[1] / "data" / "fomc_calendar.json",

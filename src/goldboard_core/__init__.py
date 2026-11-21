@@ -17,7 +17,7 @@ from .branding import APP_DISPLAY_NAME, APP_ICON_FILE, APP_LOGO_FILE, get_app_ic
 from .scoring import score_features
 from .signals import generate_signal
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "__version__",

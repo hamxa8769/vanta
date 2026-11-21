@@ -24,6 +24,9 @@ hiddenimports = tmp_ret[2]
 
 datas += [
     (str(SPEC_DIR / "assets" / "logo"), "assets/logo"),
+    # FOMC calendar: read at runtime by goldboard_data.fedwatch; without
+    # this the frozen app reports "data/fomc_calendar.json not found".
+    (str(SPEC_DIR / "data" / "fomc_calendar.json"), "data"),
 ]
 hiddenimports += [
     "goldboard_core",

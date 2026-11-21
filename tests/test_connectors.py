@@ -338,6 +338,29 @@ class TestFedWatch(BaseTest):
         self.assertTrue(any(m["start"] == "2026-12-08" for m in meetings))
         self.assertTrue(any(m.get("sep") for m in meetings))
 
+    def test_calendar_found_via_meipass_bundle(self):
+        """Frozen app: the calendar is bundled as data/ next to the exe
+        (vanta.spec datas) and found via sys._MEIPASS (v0.1.1 bug: the
+        frozen app reported 'data/fomc_calendar.json not found').
+        Both PyInstaller 6 layouts are covered: datas directly under
+        _MEIPASS, and under _MEIPASS/_internal/."""
+        import sys
+        import tempfile
+
+        for sub in ("data", os.path.join("_internal", "data")):
+            with tempfile.TemporaryDirectory() as tmp:
+                cal_dir = os.path.join(tmp, sub)
+                os.makedirs(cal_dir)
+                with open(os.path.join(cal_dir, "fomc_calendar.json"),
+                          "w", encoding="utf-8") as fh:
+                    json.dump({"meetings": [{"start": "2027-01-27",
+                                             "end": "2027-01-28"}]}, fh)
+                with mock.patch.object(sys, "_MEIPASS", tmp, create=True):
+                    meetings = next_meetings()
+            self.assertTrue(
+                any(m["start"] == "2027-01-27" for m in meetings),
+                f"calendar not found via _MEIPASS/{sub}")
+
 
 # ---------------------------------------------------------------- GDELT
 class TestGDELT(BaseTest):

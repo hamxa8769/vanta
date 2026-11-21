@@ -123,14 +123,22 @@ class FREDConnector(BaseConnector):
         return self.fetch_macro()
 
     def fetch_macro(self) -> list:
+        # The 12 series fetch concurrently: one stalled fredgraph.csv
+        # (3 attempts x 15s) must not hold up the other 11 series.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         snaps: list = []
         errors: list[str] = []
-        for sid in SERIES_IDS:
-            try:
-                snaps += self.fetch_series(sid)
-            except ConnectorError as exc:
-                errors.append(str(exc))
-                self.log.warning("fred: %s failed: %s", sid, exc)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(self.fetch_series, sid): sid
+                       for sid in SERIES_IDS}
+            for fut in as_completed(futures):
+                sid = futures[fut]
+                try:
+                    snaps += fut.result()
+                except ConnectorError as exc:
+                    errors.append(str(exc))
+                    self.log.warning("fred: %s failed: %s", sid, exc)
         if not snaps:
             return self._fail("fred: all series failed: " + "; ".join(errors))
         if errors:
