@@ -1,10 +1,11 @@
 """Vanta desktop UI (Phase 4) — PySide6/Qt, black + gold, shadow-only.
 
-Single main screen with ten panels (price, score gauge, COT chart, ETF
-flow, central-bank buying, macro, news/sentiment, signals, gates,
-freshness), a live clock, Refresh + auto-refresh on a QTimer, refresh
-in a QThread (never blocks the UI), an in-app updater, threshold
-alerts, and a log drawer.
+Single main screen with eleven panels (live price + chart, score gauge,
+COT chart, ETF flow, central-bank buying, macro, live news headlines,
+signals, gates, freshness, history backtest), a live price ticker
+(Yahoo quote every 10s), a live clock, Refresh + auto-refresh on a
+QTimer, refresh in a QThread (never blocks the UI), a Settings page
+for API keys, an in-app updater, threshold alerts, and a log drawer.
 
 Honesty rule: every number shows source + timestamp. A failed source
 shows FAILED/STALE — never an invented value. No live trading anywhere.
@@ -16,16 +17,29 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
+    QFormLayout,
     QGroupBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -46,7 +60,7 @@ from goldboard_core.branding import (
     PALETTE,
     get_app_icon_path,
 )
-from goldboard_core.config import load_config
+from goldboard_core.config import get_config_path, load_config, save_config
 from goldboard_core.gates import GATE_THRESHOLDS
 from goldboard_data.fedwatch import load_fomc_calendar, next_meetings
 
@@ -58,7 +72,14 @@ from .updater import (
     fetch_expected_sha256,
     install_update,
 )
-from .worker import FRESHNESS_SOURCES, RefreshWorker, collect_dashboard_data
+from .worker import (
+    FRESHNESS_SOURCES,
+    BacktestWorker,
+    LivePriceWorker,
+    RefreshWorker,
+    collect_dashboard_data,
+    run_history_backtest,
+)
 
 # Status colours are functional (ok / stale / failed), not brand colours;
 # every brand surface uses PALETTE from branding.py.
@@ -217,6 +238,78 @@ class CotChart(QWidget):
                          f"min {lo:,.0f}  ·  {len(values)} points")
 
 
+class PriceChart(QWidget):
+    """Custom-painted gold price chart from stored OHLC bars (live).
+
+    Bars come from the DB (Yahoo history: daily 2y / intraday 5d) —
+    never invented. ``live_tick`` is the latest ticker quote, drawn
+    as a dot at the right edge so the chart moves between refreshes.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._bars: list[dict] = []
+        self._live_tick: dict | None = None
+        self.setMinimumHeight(170)
+
+    def set_bars(self, bars: list[dict], live_tick: dict | None = None) -> None:
+        self._bars = bars or []
+        self._live_tick = live_tick
+        self.update()
+
+    def set_live_tick(self, live_tick: dict | None) -> None:
+        self._live_tick = live_tick
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width, height = self.width(), self.height()
+        bars = self._bars
+        if len(bars) < 2 and self._live_tick is None:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(0, 0, width, height, Qt.AlignCenter,
+                             "No price history yet — refresh to fetch it.")
+            return
+        closes = [float(b["close"]) for b in bars]
+        if self._live_tick is not None:
+            closes.append(float(self._live_tick["value"]))
+        lo, hi = min(closes), max(closes)
+        span = (hi - lo) or 1.0
+        pad_l, pad_r, pad_t, pad_b = 8, 8, 30, 22
+        plot_w = width - pad_l - pad_r
+        plot_h = height - pad_t - pad_b
+        n = len(closes)
+
+        def xy(i: int, v: float) -> tuple[float, float]:
+            x = pad_l + (plot_w * i / max(1, n - 1))
+            y = pad_t + plot_h * (1.0 - (v - lo) / span)
+            return x, y
+
+        # Gold line through the closes.
+        path = QPainterPath()
+        x0, y0 = xy(0, closes[0])
+        path.moveTo(x0, y0)
+        for i, v in enumerate(closes[1:], start=1):
+            x, y = xy(i, v)
+            path.lineTo(x, y)
+        painter.setPen(QPen(QColor(PALETTE["gold"]), 2))
+        painter.drawPath(path)
+        # Last stored point + live tick dot.
+        lx, ly = xy(n - 1, closes[-1])
+        painter.setBrush(QColor(PALETTE["gold_light"]))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(int(lx) - 4, int(ly) - 4, 8, 8)
+        painter.setPen(QColor(PALETTE["muted"]))
+        painter.setFont(_font(9))
+        interval = bars[-1].get("interval", "1d") if bars else "—"
+        painter.drawText(pad_l, 4, 300, 12, Qt.AlignLeft,
+                         f"high {hi:,.2f}  ·  low {lo:,.2f}")
+        painter.drawText(pad_l, height - 8, 300, 12, Qt.AlignLeft,
+                         f"{len(bars)} bars ({interval})"
+                         + ("  ·  LIVE" if self._live_tick else ""))
+
+
 # ------------------------------------------------------------- update threads
 
 class UpdateCheckThread(QThread):
@@ -266,22 +359,259 @@ class DownloadThread(QThread):
         self.done.emit(str(path), None)
 
 
+class KeyTestThread(QThread):
+    """Tests one API key off the UI thread (10s timeout, no retries)."""
+
+    done = Signal(object, object)  # (ok: bool, message: str)
+
+    def __init__(self, kind: str, key: str, endpoint: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        self.key = key
+        self.endpoint = endpoint
+
+    def run(self) -> None:  # noqa: D102 — QThread entry point
+        try:
+            if self.kind == "finnhub":
+                from goldboard_data.finnhub import FINNHUB_BASE
+                from goldboard_data.base import ConnectorError
+                conn = _QuickCheck()
+                raw = conn.get_json(
+                    f"{FINNHUB_BASE}/news-sentiment",
+                    params={"symbol": "GLD", "token": self.key})
+                if not isinstance(raw, dict) or "sentiment" not in raw:
+                    raise ConnectorError("unexpected response shape")
+                self.done.emit(True, "OK — Finnhub key works (GLD sentiment).")
+            elif self.kind == "fred":
+                from goldboard_data.fred import FRED_API_URL
+                conn = _QuickCheck()
+                raw = conn.get_json(
+                    FRED_API_URL,
+                    params={"series_id": "DFII10", "api_key": self.key,
+                            "file_type": "json", "sort_order": "desc",
+                            "limit": 1})
+                obs = (raw or {}).get("observations") or []
+                if not obs:
+                    raise ValueError("no observations returned")
+                self.done.emit(True, f"OK — FRED key works (DFII10 = {obs[0].get('value')}).")
+            elif self.kind == "fedwatch":
+                if not self.endpoint:
+                    self.done.emit(False, "Set the endpoint URL first (from the CME API page).")
+                    return
+                conn = _QuickCheck()
+                raw = conn.get_json(self.endpoint, params={"api_key": self.key})
+                if not isinstance(raw, dict):
+                    raise ValueError("endpoint did not return JSON")
+                self.done.emit(True, "OK — FedWatch endpoint answered.")
+            else:
+                self.done.emit(False, f"unknown key kind: {self.kind}")
+        except Exception as exc:
+            self.done.emit(False, f"FAILED — {exc}")
+
+
+class _QuickCheck:
+    """Minimal one-shot GET helper for key tests (no connector state)."""
+
+    def get_json(self, url: str, params: dict | None = None) -> object:
+        import requests
+
+        resp = requests.get(
+            url, params=params, timeout=10,
+            headers={"User-Agent": "Vanta/0.2 (key test)"})
+        resp.raise_for_status()
+        return resp.json()
+
+
+class SettingsDialog(QDialog):
+    """Settings page: API keys + live intervals.
+
+    Keys are saved to the config file (never logged); a key that came
+    from the environment is shown read-only. Test buttons verify the
+    key against the real provider before saving.
+    """
+
+    def __init__(self, config, parent=None) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("Settings — API keys & live data")
+        self.setMinimumWidth(560)
+        self._test_thread: KeyTestThread | None = None
+        self._test_target: str | None = None
+
+        form = QFormLayout(self)
+
+        self._finnhub_edit = QLineEdit(self)
+        self._finnhub_edit.setEchoMode(QLineEdit.Password)
+        self._finnhub_edit.setText(config.finnhub_api_key)
+        self._finnhub_edit.setPlaceholderText("finnhub.io — free, 60 calls/min")
+        self._finnhub_status = QLabel("Free key: finnhub.io → API Keys.", self)
+        self._finnhub_status.setWordWrap(True)
+        self._finnhub_test = QPushButton("Test", self)
+        self._finnhub_test.clicked.connect(
+            lambda: self._test_key("finnhub"))
+        row = QHBoxLayout()
+        row.addWidget(self._finnhub_edit)
+        row.addWidget(self._finnhub_test)
+        form.addRow("Finnhub key:", row)
+        form.addRow("", self._finnhub_status)
+
+        self._fred_edit = QLineEdit(self)
+        self._fred_edit.setEchoMode(QLineEdit.Password)
+        self._fred_edit.setText(config.fred_api_key)
+        self._fred_edit.setPlaceholderText("fred.stlouisfed.org — free")
+        self._fred_status = QLabel(
+            "Free key: fred.stlouisfed.org → My Account → API Keys. "
+            "Without it, macro data uses the slow fredgraph.csv fallback.", self)
+        self._fred_status.setWordWrap(True)
+        self._fred_test = QPushButton("Test", self)
+        self._fred_test.clicked.connect(lambda: self._test_key("fred"))
+        row = QHBoxLayout()
+        row.addWidget(self._fred_edit)
+        row.addWidget(self._fred_test)
+        form.addRow("FRED key:", row)
+        form.addRow("", self._fred_status)
+
+        self._fedwatch_edit = QLineEdit(self)
+        self._fedwatch_edit.setEchoMode(QLineEdit.Password)
+        self._fedwatch_edit.setText(config.fedwatch_api_key)
+        self._fedwatch_edit.setPlaceholderText("$25/mo CME EOD API — optional")
+        self._fedwatch_url_edit = QLineEdit(self)
+        self._fedwatch_url_edit.setText(config.fedwatch_api_url)
+        self._fedwatch_url_edit.setPlaceholderText(
+            "Endpoint URL from the CME FedWatch API page")
+        self._fedwatch_status = QLabel(
+            "Paid ($25/mo): cmegroup.com → Market Data API → FedWatch API. "
+            "Without it the board uses the manual FOMC calendar.", self)
+        self._fedwatch_status.setWordWrap(True)
+        self._fedwatch_test = QPushButton("Test", self)
+        self._fedwatch_test.clicked.connect(lambda: self._test_key("fedwatch"))
+        row = QHBoxLayout()
+        row.addWidget(self._fedwatch_edit)
+        row.addWidget(self._fedwatch_test)
+        form.addRow("FedWatch key:", row)
+        form.addRow("FedWatch endpoint:", self._fedwatch_url_edit)
+        form.addRow("", self._fedwatch_status)
+
+        if config._finnhub_key_from_env:
+            self._finnhub_edit.setReadOnly(True)
+            self._finnhub_status.setText(
+                "Finnhub key comes from the environment "
+                "(GOLD_BOARD_FINNHUB_KEY) — change it there.")
+        if config._fred_key_from_env:
+            self._fred_edit.setReadOnly(True)
+            self._fred_status.setText(
+                "FRED key comes from the environment "
+                "(GOLD_BOARD_FRED_KEY) — change it there.")
+        if config._fedwatch_key_from_env:
+            self._fedwatch_edit.setReadOnly(True)
+            self._fedwatch_url_edit.setReadOnly(True)
+            self._fedwatch_status.setText(
+                "FedWatch key comes from the environment — change it there.")
+
+        self._price_spin = QSpinBox(self)
+        self._price_spin.setRange(5, 60)
+        self._price_spin.setValue(config.price_refresh_seconds)
+        self._price_spin.setSuffix(" s")
+        form.addRow("Live price ticker:", self._price_spin)
+
+        self._full_spin = QSpinBox(self)
+        self._full_spin.setRange(5, 1440)
+        self._full_spin.setValue(config.full_refresh_minutes)
+        self._full_spin.setSuffix(" min")
+        form.addRow("Full refresh (all sources):", self._full_spin)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addWidget(buttons)
+
+    def _test_key(self, kind: str) -> None:
+        if self._test_thread is not None and self._test_thread.isRunning():
+            return
+        key = {
+            "finnhub": self._finnhub_edit.text().strip(),
+            "fred": self._fred_edit.text().strip(),
+            "fedwatch": self._fedwatch_edit.text().strip(),
+        }[kind]
+        endpoint = self._fedwatch_url_edit.text().strip()
+        status = {
+            "finnhub": self._finnhub_status,
+            "fred": self._fred_status,
+            "fedwatch": self._fedwatch_status,
+        }[kind]
+        if not key:
+            status.setText("Enter a key first.")
+            return
+        status.setText("Testing…")
+        self._test_target = kind
+        self._test_thread = KeyTestThread(kind, key, endpoint, self)
+        self._test_thread.done.connect(self._on_test_done)
+        self._test_thread.start()
+
+    def _on_test_done(self, ok: bool, message: str) -> None:
+        status = {
+            "finnhub": self._finnhub_status,
+            "fred": self._fred_status,
+            "fedwatch": self._fedwatch_status,
+        }.get(self._test_target or "")
+        if status is not None:
+            status.setText(message)
+
+    def apply_to(self, config) -> None:
+        """Copy the dialog values into the config (call before save)."""
+        if not config._finnhub_key_from_env:
+            config.finnhub_api_key = self._finnhub_edit.text().strip()
+        if not config._fred_key_from_env:
+            config.fred_api_key = self._fred_edit.text().strip()
+        if not config._fedwatch_key_from_env:
+            config.fedwatch_api_key = self._fedwatch_edit.text().strip()
+        if not config._fedwatch_url_from_env:
+            config.fedwatch_api_url = self._fedwatch_url_edit.text().strip()
+        config.price_refresh_seconds = self._price_spin.value()
+        config.full_refresh_minutes = self._full_spin.value()
+
+
 # --------------------------------------------------------------- main window
 
 class MainWindow(QMainWindow):
     """Vanta main window — one screen, ten panels, black + gold."""
 
-    def __init__(self, db_path: str | Path | None = None, parent=None) -> None:
+    def __init__(self, db_path: str | Path | None = None, parent=None,
+                 enable_live_ticker: bool = True) -> None:
         super().__init__(parent)
+        self._enable_live_ticker = enable_live_ticker
         self.config = load_config()
         self.db_path = Path(db_path) if db_path else Path(self.config.db_path)
         self.settings = QSettings("Vanta", "GoldBoard")
+        # One-time migration: v0.1.x kept the refresh interval in
+        # QSettings; v0.2.0 keeps it in the config file. A config file
+        # that predates the field keeps the QSettings value.
+        try:
+            import json as _json
+
+            raw = _json.loads(get_config_path().read_text(encoding="utf-8")) \
+                if get_config_path().is_file() else {}
+            if "full_refresh_minutes" not in raw:
+                qmin = self.settings.value("auto_refresh_minutes", None, type=int)
+                if qmin:
+                    self.config.full_refresh_minutes = int(qmin)
+        except Exception:
+            pass
         self._last_signal_direction: str | None = None
         self._last_total: float | None = None
         self._pending_update: dict | None = None
         self._worker: RefreshWorker | None = None
+        self._ticker: LivePriceWorker | None = None
+        self._backtest_worker: BacktestWorker | None = None
         self._update_thread: UpdateCheckThread | None = None
         self._download_thread: DownloadThread | None = None
+        self._last_tick_value: float | None = None
+        self._ticker_ok: bool | None = None
+        self._chart_range: str = "5D"
+        self._chart_bars_daily: list[dict] = []
+        self._chart_bars_intraday: list[dict] = []
+        self._live_tick: dict | None = None
 
         self.setWindowTitle(f"{APP_DISPLAY_NAME} — Gold Institutional Analysis Board")
         icon_path = get_app_icon_path()
@@ -318,6 +648,8 @@ class MainWindow(QMainWindow):
         self.log("Vanta started — loaded from local DB; starting refresh.")
         QTimer.singleShot(500, self.start_refresh)
         QTimer.singleShot(2000, self.check_for_updates)
+        # Live price ticker (header price ticks every N seconds).
+        QTimer.singleShot(1000, self._start_ticker)
 
     # ------------------------------------------------------------------ style
 
@@ -339,6 +671,9 @@ class MainWindow(QMainWindow):
             border: 1px solid {PALETTE["gold"]}; }}
         QSpinBox {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 3px; }}
+        QLineEdit {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
+            border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 4px; }}
+        QLineEdit:read-only {{ color: {PALETTE["muted"]}; }}
         QListWidget {{ background: {PALETTE["black"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 4px; }}
         QPlainTextEdit {{ background: {PALETTE["black"]};
@@ -372,9 +707,17 @@ class MainWindow(QMainWindow):
         version.setProperty("class", "muted")
         layout.addWidget(version)
         layout.addStretch(1)
+        self._live_dot = QLabel("● LIVE", header)
+        self._live_dot.setFont(_font(11, bold=True))
+        self._live_dot.setStyleSheet(f"color: {PALETTE['muted']};")
+        layout.addWidget(self._live_dot)
         self._clock_label = QLabel(header)
         self._clock_label.setFont(_font(11))
         layout.addWidget(self._clock_label)
+        self._settings_button = QPushButton("Settings", header)
+        self._settings_button.setProperty("class", "ghost")
+        self._settings_button.clicked.connect(self._open_settings)
+        layout.addWidget(self._settings_button)
         self._update_button = QPushButton("Update available", header)
         self._update_button.setVisible(False)
         self._update_button.clicked.connect(self._on_update_button)
@@ -386,8 +729,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Auto-refresh (min):", header))
         self._interval_spin = QSpinBox(header)
         self._interval_spin.setRange(5, 1440)
-        self._interval_spin.setValue(
-            self.settings.value("auto_refresh_minutes", 15, type=int))
+        self._interval_spin.setValue(self.config.full_refresh_minutes)
         self._interval_spin.valueChanged.connect(self._on_interval_changed)
         layout.addWidget(self._interval_spin)
         self._refresh_button = QPushButton("Refresh", header)
@@ -406,8 +748,8 @@ class MainWindow(QMainWindow):
         content = QWidget(scroll)
         grid = QGridLayout(content)
 
-        # (1) Gold price.
-        box, layout = self._panel("Gold price (XAUUSD)")
+        # (1) Gold price + live chart.
+        box, layout = self._panel("Gold price (XAUUSD) — LIVE")
         self._price_value = QLabel("—", content)
         self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._price_value.setFont(_font(22, bold=True))
@@ -418,9 +760,24 @@ class MainWindow(QMainWindow):
         self._price_source.setProperty("class", "muted")
         self._price_source.setWordWrap(True)
         self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._price_chart = PriceChart(content)
+        range_row = QHBoxLayout()
+        self._range_buttons: dict[str, QPushButton] = {}
+        for label in ("1D", "5D", "1M", "1Y", "2Y"):
+            btn = QPushButton(label, content)
+            btn.setProperty("class", "ghost")
+            btn.setCheckable(True)
+            btn.setChecked(label == self._chart_range)
+            btn.clicked.connect(
+                lambda _checked=False, r=label: self._set_chart_range(r))
+            self._range_buttons[label] = btn
+            range_row.addWidget(btn)
+        range_row.addStretch(1)
         layout.addWidget(self._price_value)
         layout.addWidget(self._price_change)
         layout.addWidget(self._price_source)
+        layout.addWidget(self._price_chart)
+        layout.addLayout(range_row)
         layout.addStretch(1)
         grid.addWidget(box, 0, 0)
 
@@ -479,12 +836,18 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         grid.addWidget(box, 1, 2)
 
-        # (7) News / sentiment.
-        box, layout = self._panel("News & sentiment")
+        # (7) News / sentiment — live headlines (click to open).
+        box, layout = self._panel("Live news & sentiment")
         self._news_label = QLabel("No news data yet.", content)
         self._news_label.setWordWrap(True)
         self._news_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._news_list = QListWidget(content)
+        self._news_list.setWordWrap(True)
+        self._news_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._news_list.setMinimumHeight(140)
+        self._news_list.itemClicked.connect(self._on_news_clicked)
         layout.addWidget(self._news_label)
+        layout.addWidget(self._news_list)
         layout.addStretch(1)
         grid.addWidget(box, 2, 0)
 
@@ -524,6 +887,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._freshness_list)
         grid.addWidget(box, 3, 0, 1, 3)
 
+        # (11) History backtest.
+        box, layout = self._panel("Backtest on history (real OHLC)")
+        self._backtest_label = QLabel(
+            "No history yet — refresh to fetch 2y daily + 5d intraday bars.",
+            content)
+        self._backtest_label.setWordWrap(True)
+        self._backtest_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        bt_row = QHBoxLayout()
+        self._backtest_button = QPushButton("Run backtest", content)
+        self._backtest_button.clicked.connect(self._run_backtest)
+        bt_row.addWidget(self._backtest_button)
+        bt_row.addStretch(1)
+        layout.addWidget(self._backtest_label)
+        layout.addLayout(bt_row)
+        layout.addStretch(1)
+        grid.addWidget(box, 4, 0, 1, 3)
+
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
@@ -562,13 +942,157 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- refresh
 
     def _on_interval_changed(self, minutes: int) -> None:
-        self.settings.setValue("auto_refresh_minutes", minutes)
+        self.config.full_refresh_minutes = minutes
+        save_config(self.config)
         self._apply_refresh_interval()
         self.log(f"Auto-refresh set to every {minutes} min.")
 
     def _apply_refresh_interval(self) -> None:
-        minutes = self.settings.value("auto_refresh_minutes", 15, type=int)
+        minutes = self.config.full_refresh_minutes
         self._refresh_timer.setInterval(max(1, minutes) * 60 * 1000)
+
+    # ------------------------------------------------------------- settings
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self.config, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        dialog.apply_to(self.config)
+        save_config(self.config)
+        self.config = load_config()
+        self._interval_spin.setValue(self.config.full_refresh_minutes)
+        self._apply_refresh_interval()
+        self._restart_ticker()
+        self.log("Settings saved.")
+        self.statusBar().showMessage(
+            "Settings saved — keys apply on the next refresh.")
+        # Keys changed: refresh now so the new sources show up.
+        QTimer.singleShot(500, self.start_refresh)
+
+    # ------------------------------------------------------------ live ticker
+
+    def _start_ticker(self) -> None:
+        if not self._enable_live_ticker:
+            return
+        if self._ticker is not None and self._ticker.isRunning():
+            return
+        self._ticker = LivePriceWorker(self.config.price_refresh_seconds, self)
+        self._ticker.price_updated.connect(self._on_live_price)
+        self._ticker.failed.connect(self._on_live_price_failed)
+        self._ticker.start()
+
+    def _restart_ticker(self) -> None:
+        if self._ticker is not None and self._ticker.isRunning():
+            self._ticker.stop()
+            self._ticker.wait(2000)
+        self._ticker = None
+        self._start_ticker()
+
+    def _on_live_price(self, tick: dict) -> None:
+        if self._ticker_ok is not True:
+            self.log("Live ticker connected — price updating every "
+                     f"{self.config.price_refresh_seconds}s.")
+        self._ticker_ok = True
+        self._live_dot.setText("● LIVE")
+        self._live_dot.setStyleSheet(f"color: {STATUS_COLORS['ok']};")
+        value = float(tick["value"])
+        prev = self._last_tick_value
+        self._last_tick_value = value
+        self._live_tick = tick
+        self._price_value.setText(_fmt_value(value, "USD/oz"))
+        stamp = _fmt_time(tick.get("fetched_at"))
+        self._price_source.setText(
+            f"Source: Yahoo Finance delayed quote (GC=F) as proxy for live "
+            f"XAUUSD spot · tick {stamp}")
+        if prev is not None and prev > 0:
+            change = value - prev
+            pct = change / prev * 100.0
+            sign = "+" if change >= 0 else ""
+            color = STATUS_COLORS["ok"] if change >= 0 else STATUS_COLORS["failed"]
+            self._price_change.setText(
+                f"{sign}{change:,.2f} ({sign}{pct:.3f}%) since last tick")
+            self._price_change.setStyleSheet(f"color: {color};")
+        self._price_chart.set_live_tick(tick)
+
+    def _on_live_price_failed(self, message: str) -> None:
+        if self._ticker_ok is not False:
+            self.log(f"Live ticker failed: {message} — keeping last price.")
+        self._ticker_ok = False
+        self._live_dot.setText("● LIVE — retrying")
+        self._live_dot.setStyleSheet(f"color: {STATUS_COLORS['failed']};")
+
+    # ------------------------------------------------------------- chart
+
+    def _set_chart_range(self, range_label: str) -> None:
+        self._chart_range = range_label
+        for label, btn in self._range_buttons.items():
+            btn.setChecked(label == range_label)
+        self._refresh_chart()
+
+    def _refresh_chart(self) -> None:
+        if self._chart_range in ("1D", "5D"):
+            bars = self._chart_bars_intraday
+            if self._chart_range == "1D":
+                bars = bars[-96:]
+        else:
+            count = {"1M": 22, "1Y": 250, "2Y": 500}[self._chart_range]
+            bars = self._chart_bars_daily[-count:]
+        self._price_chart.set_bars(bars, self._live_tick)
+
+    # -------------------------------------------------------------- news
+
+    def _on_news_clicked(self, item: QListWidgetItem) -> None:
+        url = item.data(Qt.UserRole) or ""
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    # ----------------------------------------------------------- backtest
+
+    def _run_backtest(self) -> None:
+        if self._backtest_worker is not None and self._backtest_worker.isRunning():
+            return
+        self._backtest_button.setEnabled(False)
+        self._backtest_label.setText("Running backtest on stored history…")
+        self._backtest_worker = BacktestWorker(str(self.db_path), self)
+        self._backtest_worker.finished.connect(self._on_backtest_finished)
+        self._backtest_worker.failed.connect(self._on_backtest_failed)
+        self._backtest_worker.start()
+
+    @staticmethod
+    def _bt_lines(title: str, res: dict) -> list[str]:
+        if not res or res.get("n_trades", 0) == 0:
+            note = res.get("note", "no trades") if isinstance(res, dict) else "no trades"
+            return [f"{title}: no trades ({note})"]
+        pf = res.get("profit_factor")
+        pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+        return [
+            f"{title}: {res['n_trades']} trades · "
+            f"win {res['win_rate']:.0%} · total {res['total_r']:+.2f}R · "
+            f"expectancy {res['expectancy_r']:+.2f}R · PF {pf_text} · "
+            f"max DD {res['max_drawdown_r']:.2f}R",
+        ]
+
+    def _on_backtest_finished(self, result: dict) -> None:
+        self._backtest_button.setEnabled(True)
+        lines = [f"History: {result.get('bars_daily', 0)} daily bars (2y)."]
+        lines += self._bt_lines("Board signals (live)", result.get("live", {}))
+        lines += self._bt_lines("Replay (price-only)", result.get("replay", {}))
+        folds = result.get("folds", [])
+        if folds:
+            fold_text = " · ".join(
+                f"F{f['fold']}: {f['n_trades']} trades, "
+                f"{f['total_r']:+.2f}R" for f in folds)
+            lines.append(f"Walk-forward (3 folds): {fold_text}")
+        lines.append(result.get("rule", ""))
+        self._backtest_label.setText("\n".join(lines))
+        self.log("Backtest finished: "
+                 f"{result.get('replay', {}).get('n_trades', 0)} replay trades, "
+                 f"{result.get('live', {}).get('n_trades', 0)} board-signal trades.")
+
+    def _on_backtest_failed(self, message: str) -> None:
+        self._backtest_button.setEnabled(True)
+        self._backtest_label.setText(f"Backtest failed: {message}")
+        self.log(f"ERROR: {message}")
 
     def start_refresh(self) -> None:
         if self._worker is not None and self._worker.isRunning():
@@ -620,6 +1144,10 @@ class MainWindow(QMainWindow):
             self._price_change.setText("Change: —")
             self._price_source.setText(
                 "No price yet — refresh to fetch the Yahoo quote (proxy).")
+        # Live chart from stored OHLC bars.
+        self._chart_bars_daily = payload.get("price_bars_daily", []) or []
+        self._chart_bars_intraday = payload.get("price_bars_intraday", []) or []
+        self._refresh_chart()
 
         # (2) Score + components.
         score = payload.get("score")
@@ -703,7 +1231,7 @@ class MainWindow(QMainWindow):
             macro_lines.append(f"FOMC calendar unavailable: {exc}")
         self._macro_label.setText("\n".join(macro_lines))
 
-        # (7) News / sentiment.
+        # (7) News / sentiment — live headlines (click to open).
         news_lines = [
             _snapshot_line(snaps.get("gdelt_gold_tone_latest"), "GDELT gold tone"),
             _snapshot_line(snaps.get("gdelt_gold_tone_7d_avg"), "GDELT tone 7d avg"),
@@ -716,8 +1244,19 @@ class MainWindow(QMainWindow):
                 snaps.get("finnhub_gold_news_count"), "Finnhub gold news count"))
         else:
             news_lines.append(
-                "Finnhub: key required — set GOLD_BOARD_FINNHUB_KEY to enable.")
+                "Finnhub: key required — set it in Settings to enable.")
         self._news_label.setText("\n".join(news_lines))
+        self._news_list.clear()
+        for item in payload.get("news", [])[:30]:
+            stamp = _fmt_time(item.get("published_at"))
+            text = (f"[{item.get('provider', '')}] {item.get('title', '')} "
+                    f"— {item.get('source', '')} · {stamp}")
+            list_item = QListWidgetItem(text)
+            list_item.setData(Qt.UserRole, item.get("url") or "")
+            self._news_list.addItem(list_item)
+        if not payload.get("news"):
+            self._news_list.addItem(QListWidgetItem(
+                "No headlines yet — refresh to fetch GDELT news."))
 
         # (8) Signals.
         signal = payload.get("signal")
@@ -769,6 +1308,14 @@ class MainWindow(QMainWindow):
             self._freshness_list.addItem(item)
 
         self._check_alerts(payload)
+
+        # (11) Backtest — history coverage line (results arrive on demand).
+        daily = len(self._chart_bars_daily)
+        intraday = len(self._chart_bars_intraday)
+        self._backtest_label.setText(
+            f"History stored: {daily} daily bars (2y) · {intraday} intraday "
+            f"bars (5d, 15m). Press “Run backtest” to evaluate the board's "
+            f"signals and the price-only replay on the daily bars.")
 
     # ------------------------------------------------------------------ alerts
 
@@ -892,6 +1439,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
         self._clock_timer.stop()
         self._refresh_timer.stop()
+        if self._ticker is not None and self._ticker.isRunning():
+            self._ticker.stop()
+            self._ticker.wait(2000)
         # Wait for background threads: destroying a running QThread aborts
         # the process, so bound the waits (update check timeout is 8s).
         # The refresh worker has no cooperative stop flag (its run() is a
@@ -900,6 +1450,7 @@ class MainWindow(QMainWindow):
         # its DB writes are single atomic SQLite transactions.
         for thread, wait_ms in (
             (self._worker, 15000),
+            (self._backtest_worker, 15000),
             (self._update_thread, 9000),
             (self._download_thread, 3000),
         ):

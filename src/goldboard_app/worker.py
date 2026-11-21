@@ -1,9 +1,12 @@
 """Refresh worker for Vanta (Phase 4).
 
 ``collect_dashboard_data`` does the real work without Qt so it is
-unit-testable: refresh every connector via the registry, then score
+unit-testable: refresh every connector via the registry, fetch price
+history (daily 2y + intraday 5d) and live news headlines, then score
 and signal from the DB. ``RefreshWorker`` runs it on a QThread so the
-UI never blocks on network I/O.
+UI never blocks on network I/O. ``LivePriceWorker`` polls the Yahoo
+quote every few seconds (short timeout, no retries) so the header
+price ticks live between full refreshes.
 
 Note: ``registry.refresh_all(db_path)`` persists every fetched
 snapshot to the DB (v0.1.2 fix — before that it stored nothing and
@@ -16,15 +19,24 @@ an invented value.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from goldboard_core.api import get_features, get_score, get_signal
+from goldboard_core.backtest import backtest, split_backtest
 from goldboard_core.gates import evaluate_gates, ready_for_muuk
+from goldboard_core.replay import REPLAY_RULE_TEXT, generate_replay_signals
 from goldboard_core.storage import (
+    get_latest_news,
     get_latest_snapshot_by_series,
     get_latest_snapshot_for_source,
+    get_meta,
+    get_price_bars,
     list_signals,
+    save_news,
+    save_price_bars,
+    set_meta,
 )
 from goldboard_data.registry import refresh_all
 
@@ -74,6 +86,92 @@ def _series_history(
         stamp = row["as_of"] or row["fetched_at"]
         out.append({"as_of": stamp, "value": float(row["value"])})
     return out
+
+
+def _fetch_history(db_path: str, errors: list[str]) -> None:
+    """Fetch + store price history (intraday every refresh, daily 1/day).
+
+    Never raises: a failed history fetch is recorded in ``errors`` and
+    the chart simply keeps its stored bars.
+    """
+    from goldboard_data.price import PriceConnector
+
+    conn = PriceConnector()
+    # Intraday (5d, 15m) — cheap, every refresh, so the chart moves.
+    try:
+        bars = conn.fetch_history(range_="5d", interval="15m")
+        save_price_bars(db_path, bars)
+    except Exception as exc:
+        errors.append(f"intraday history failed: {exc}")
+    # Daily (2y, 1d) — once a day is plenty for the backtest.
+    try:
+        last = get_meta(db_path, "history_daily_fetched_at")
+        due = True
+        if last:
+            try:
+                due = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(last)).total_seconds() > 20 * 3600
+            except ValueError:
+                due = True
+        if due:
+            bars = conn.fetch_history(range_="2y", interval="1d")
+            save_price_bars(db_path, bars)
+            set_meta(db_path, "history_daily_fetched_at",
+                     datetime.now(timezone.utc).isoformat())
+    except Exception as exc:
+        errors.append(f"daily history failed: {exc}")
+
+
+def _fetch_news(db_path: str, errors: list[str]) -> None:
+    """Fetch + store live headlines (GDELT keyless, Finnhub if keyed)."""
+    from goldboard_data.finnhub import FinnhubConnector
+    from goldboard_data.gdelt import GDELTConnector
+
+    try:
+        items = GDELTConnector().fetch_headlines()
+        save_news(db_path, items)
+    except Exception as exc:
+        errors.append(f"GDELT headlines failed: {exc}")
+    try:
+        conn = FinnhubConnector()
+        if conn.api_key:
+            items = conn.fetch_headlines()
+            if items:
+                save_news(db_path, items)
+    except Exception as exc:
+        errors.append(f"Finnhub headlines failed: {exc}")
+
+
+def run_history_backtest(db_path: str | Path) -> dict:
+    """Backtest on stored history. Pure reads + pure backtest engine.
+
+    Returns {"bars_daily", "live", "replay", "folds", "rule"} where
+    "live" evaluates the board's own stored signals against the daily
+    bars, and "replay" evaluates the price-only replay rule
+    (REPLAY_RULE_TEXT) on the same bars. Empty history -> zero-trade
+    results, never an invented outcome.
+    """
+    db_path = str(db_path)
+    daily = get_price_bars(db_path, "1d", limit=600)
+    prices = [(b["ts"], b["close"], b["high"], b["low"]) for b in daily]
+    live_signals = list_signals(db_path, limit=200)
+    live = backtest(live_signals, prices).to_dict() if live_signals else {
+        "n_trades": 0, "wins": 0, "losses": 0, "total_r": 0.0,
+        "win_rate": 0.0, "expectancy_r": 0.0, "profit_factor": 0.0,
+        "max_drawdown_r": 0.0, "sharpe_per_trade": 0.0,
+        "note": "no board signals stored yet — signals accumulate as "
+                "the board runs; run a full refresh first.",
+    }
+    replay_signals = generate_replay_signals(daily)
+    replay = backtest(replay_signals, prices).to_dict()
+    folds = split_backtest(replay_signals, prices, 3) if replay_signals else []
+    return {
+        "bars_daily": len(daily),
+        "live": live,
+        "replay": replay,
+        "folds": folds,
+        "rule": REPLAY_RULE_TEXT,
+    }
 
 
 def _freshness(db_path: str | Path, report: dict | None) -> dict[str, dict]:
@@ -129,6 +227,9 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         "cot_history": [],
         "snapshots": {},
         "freshness": {},
+        "news": [],
+        "price_bars_intraday": [],
+        "price_bars_daily": [],
         "errors": [],
     }
 
@@ -138,6 +239,11 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         except Exception as exc:  # registry must never kill the refresh
             payload["errors"].append(f"refresh failed: {exc!r}")
             payload["report"] = {}
+        # History + headlines ride along with the refresh (stored, then
+        # read back below — the chart/news panels only ever show stored
+        # real data, never a live-fetch promise).
+        _fetch_history(db_path, payload["errors"])
+        _fetch_news(db_path, payload["errors"])
 
     try:
         payload["features"] = get_features(db_path)
@@ -199,6 +305,18 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
     payload["price_history"] = _series_history(db_path, "price_xauusd", limit=60)
     payload["cot_history"] = _series_history(db_path, "cot_gold_mm_net", limit=52)
     payload["freshness"] = _freshness(db_path, payload["report"] or None)
+    try:
+        payload["news"] = get_latest_news(db_path, limit=30)
+    except Exception:
+        payload["news"] = []
+    try:
+        payload["price_bars_intraday"] = get_price_bars(db_path, "15m", limit=500)
+    except Exception:
+        payload["price_bars_intraday"] = []
+    try:
+        payload["price_bars_daily"] = get_price_bars(db_path, "1d", limit=600)
+    except Exception:
+        payload["price_bars_daily"] = []
     return payload
 
 
@@ -221,6 +339,71 @@ if _QT_AVAILABLE:
                 self.failed.emit(f"refresh failed: {exc!r}")
                 return
             self.finished.emit(payload)
+
+    class LivePriceWorker(QThread):  # type: ignore[misc]
+        """Polls the Yahoo quote every N seconds for the live ticker.
+
+        Short timeout (5s), no retries: one slow attempt must never
+        stall the loop. Emits price_updated {value, as_of, fetched_at}
+        or failed (keeps the last price on screen, never invents one).
+        Stop with stop() + wait(); the sleep is chunked so shutdown is
+        responsive.
+        """
+
+        price_updated = Signal(dict)  # type: ignore[assignment]
+        failed = Signal(str)  # type: ignore[assignment]
+
+        def __init__(self, interval_seconds: int = 10, parent=None) -> None:
+            super().__init__(parent)
+            self.interval_seconds = max(5, int(interval_seconds))
+            self._stop = False
+
+        def stop(self) -> None:
+            self._stop = True
+
+        def run(self) -> None:  # noqa: D102 — QThread entry point
+            from goldboard_data.price import (
+                YAHOO_CHART_URL,
+                PriceConnector,
+            )
+
+            conn = PriceConnector()
+            while not self._stop:
+                try:
+                    data = conn._get_json(
+                        YAHOO_CHART_URL.format(symbol="GC=F"),
+                        params={"range": "1d", "interval": "1d"},
+                        timeout=5, retries=0)
+                    snaps = conn.parse(data)
+                    snap = snaps[0]
+                    self.price_updated.emit({
+                        "value": snap.value,
+                        "as_of": snap.as_of.isoformat() if snap.as_of else None,
+                        "fetched_at": snap.fetched_at.isoformat()
+                        if snap.fetched_at else _now_iso(),
+                    })
+                except Exception as exc:  # keep last price, report the miss
+                    self.failed.emit(str(exc))
+                for _ in range(self.interval_seconds * 10):
+                    if self._stop:
+                        return
+                    time.sleep(0.1)
+
+    class BacktestWorker(QThread):  # type: ignore[misc]
+        """Runs the history backtest off the UI thread."""
+
+        finished = Signal(dict)  # type: ignore[assignment]
+        failed = Signal(str)  # type: ignore[assignment]
+
+        def __init__(self, db_path: str | Path, parent=None) -> None:
+            super().__init__(parent)
+            self.db_path = str(db_path)
+
+        def run(self) -> None:  # noqa: D102 — QThread entry point
+            try:
+                self.finished.emit(run_history_backtest(self.db_path))
+            except Exception as exc:  # pragma: no cover — defensive
+                self.failed.emit(f"backtest failed: {exc!r}")
 
 else:  # pragma: no cover — Qt missing
 

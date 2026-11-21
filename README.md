@@ -150,8 +150,17 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.1.2**. Every release bumps the
+carry the same version. Current: **0.2.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.2.0 makes the board live: a Settings page (Finnhub/FRED/FedWatch
+keys with Test buttons + live intervals), a live price ticker (Yahoo
+quote every 10s, short timeout, no retries), a live price chart from
+stored OHLC history (2y daily + 5d intraday, fetched from Yahoo),
+live news headlines (GDELT ArtList keyless + Finnhub when keyed,
+click to open), and a history backtest panel (board signals + a
+clearly-labelled price-only replay rule on the daily bars). The data
+was always live — v0.2.0 makes the app *look* live too.
 
 v0.1.2 makes the board actually functional: v0.1.1 fetched data but
 never stored it, so every panel stayed on "no data yet" — `refresh_all`

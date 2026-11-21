@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover - core not present yet
         vintage: str | None = None
 
 
-USER_AGENT = "Vanta/0.1 (XAUUSD institutional analysis board; research use)"
+USER_AGENT = "Vanta/0.2 (XAUUSD institutional analysis board; research use)"
 DEFAULT_TIMEOUT = 15
 MAX_RETRIES = 2  # retries after the first attempt
 
@@ -89,36 +89,49 @@ class BaseConnector(ABC):
 
     # -- HTTP ---------------------------------------------------------
     def _get(self, url: str, params: dict | None = None,
-             headers: dict | None = None) -> requests.Response:
-        """GET with real User-Agent, 15s timeout, 2 retries + backoff.
+             headers: dict | None = None,
+             timeout: int | None = None,
+             retries: int | None = None) -> requests.Response:
+        """GET with real User-Agent, timeout and retries + backoff.
 
+        Defaults: 15s timeout, 2 retries. Callers that poll fast (the
+        live price ticker) pass a short timeout and 0 retries so one
+        slow attempt never stalls the loop.
         Returns the response on HTTP 2xx, else raises ConnectorError.
         """
         hdrs = {"User-Agent": USER_AGENT, "Accept": "*/*"}
         if headers:
             hdrs.update(headers)
+        timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+        max_retries = MAX_RETRIES if retries is None else retries
         last_exc: Exception | None = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(max_retries + 1):
             try:
                 resp = requests.get(url, params=params, headers=hdrs,
-                                    timeout=DEFAULT_TIMEOUT)
+                                    timeout=timeout)
                 resp.raise_for_status()
                 return resp
             except requests.RequestException as exc:  # timeout / HTTP / DNS
                 last_exc = exc
                 self.log.warning("%s: GET %s attempt %d failed: %s",
                                  self.name, url, attempt + 1, exc)
-                if attempt < MAX_RETRIES:
+                if attempt < max_retries:
                     time.sleep(2 ** attempt)  # 1s, then 2s
         raise ConnectorError(f"{self.name}: GET {url} failed after "
-                             f"{MAX_RETRIES + 1} attempts: {last_exc}")
+                             f"{max_retries + 1} attempts: {last_exc}")
 
-    def _get_text(self, url: str, params: dict | None = None) -> str:
-        return self._get(url, params=params).text
+    def _get_text(self, url: str, params: dict | None = None,
+                  timeout: int | None = None,
+                  retries: int | None = None) -> str:
+        return self._get(url, params=params, timeout=timeout,
+                         retries=retries).text
 
-    def _get_json(self, url: str, params: dict | None = None) -> Any:
+    def _get_json(self, url: str, params: dict | None = None,
+                  timeout: int | None = None,
+                  retries: int | None = None) -> Any:
         try:
-            return self._get(url, params=params).json()
+            return self._get(url, params=params, timeout=timeout,
+                             retries=retries).json()
         except ValueError as exc:
             raise ConnectorError(f"{self.name}: {url} did not return JSON: {exc}")
 

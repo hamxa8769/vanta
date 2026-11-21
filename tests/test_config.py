@@ -12,6 +12,8 @@ def _isolated_config(tmp_path, monkeypatch):
     monkeypatch.setenv("GOLD_BOARD_CONFIG_DIR", str(tmp_path / "cfg"))
     monkeypatch.delenv("GOLD_BOARD_FRED_KEY", raising=False)
     monkeypatch.delenv("GOLD_BOARD_FINNHUB_KEY", raising=False)
+    monkeypatch.delenv("GOLD_BOARD_FEDWATCH_KEY", raising=False)
+    monkeypatch.delenv("GOLD_BOARD_FEDWATCH_URL", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     yield
 
@@ -77,3 +79,37 @@ def test_corrupt_config_raises():
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(json.JSONDecodeError):
         config_mod.load_config()
+
+
+def test_v020_fields_round_trip():
+    """FedWatch key/URL + live intervals persist (v0.2.0 settings)."""
+    cfg = config_mod.load_config()
+    assert cfg.price_refresh_seconds == 10
+    assert cfg.full_refresh_minutes == 15
+    cfg.fedwatch_api_key = "fw-key"
+    cfg.fedwatch_api_url = "https://example.invalid/fedwatch"
+    cfg.price_refresh_seconds = 5
+    cfg.full_refresh_minutes = 30
+    config_mod.save_config(cfg)
+    loaded = config_mod.load_config()
+    assert loaded.fedwatch_api_key == "fw-key"
+    assert loaded.fedwatch_api_url == "https://example.invalid/fedwatch"
+    assert loaded.price_refresh_seconds == 5
+    assert loaded.full_refresh_minutes == 30
+
+
+def test_fedwatch_env_beats_config_and_never_persists(monkeypatch):
+    cfg = config_mod.load_config()
+    cfg.fedwatch_api_key = "from-config-file"
+    cfg.fedwatch_api_url = "https://example.invalid/from-config"
+    config_mod.save_config(cfg)
+    monkeypatch.setenv("GOLD_BOARD_FEDWATCH_KEY", "from-env")
+    monkeypatch.setenv("GOLD_BOARD_FEDWATCH_URL", "https://example.invalid/from-env")
+    loaded = config_mod.load_config()
+    assert loaded.fedwatch_api_key == "from-env"
+    assert loaded.fedwatch_api_url == "https://example.invalid/from-env"
+    path = config_mod.save_config(loaded)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["fedwatch_api_key"] == ""
+    assert on_disk["fedwatch_api_url"] == ""
+    assert "from-env" not in path.read_text(encoding="utf-8")

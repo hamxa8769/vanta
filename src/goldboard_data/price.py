@@ -54,3 +54,58 @@ class PriceConnector(BaseConnector):
                 errors.append(f"{symbol}: {exc}")
                 self.log.warning("price: %s", exc)
         return self._fail("price: " + "; ".join(errors))
+
+    # -- history --------------------------------------------------------
+    def parse_history(self, raw, interval: str) -> list[dict]:
+        """Parse a Yahoo chart JSON into OHLC bars.
+
+        Returns [{ts, open, high, low, close, volume, interval}] sorted
+        oldest→newest. Bars with a missing close are skipped (Yahoo
+        returns nulls for non-trading slots); nothing is invented.
+        """
+        if not isinstance(raw, dict):
+            raise ConnectorError("price: expected Yahoo chart JSON")
+        try:
+            result = raw["chart"]["result"][0]
+            stamps = result["timestamp"]
+            quote = result["indicators"]["quote"][0]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ConnectorError(f"price: no OHLC in Yahoo chart JSON: {exc}")
+        bars: list[dict] = []
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
+        for i, ts in enumerate(stamps):
+            try:
+                close = closes[i]
+                if close is None:
+                    continue
+                open_ = opens[i] if opens[i] is not None else float(close)
+                high = highs[i] if highs[i] is not None else float(close)
+                low = lows[i] if lows[i] is not None else float(close)
+                volume = volumes[i] if i < len(volumes) else None
+            except (IndexError, TypeError, ValueError):
+                continue
+            bars.append({
+                "ts": datetime.fromtimestamp(ts, tz=timezone.utc),
+                "open": float(open_), "high": float(high),
+                "low": float(low), "close": float(close),
+                "volume": None if volume is None else float(volume),
+                "interval": interval,
+            })
+        if not bars:
+            raise ConnectorError("price: Yahoo chart JSON has no usable bars")
+        return bars
+
+    def fetch_history(self, range_: str = "2y", interval: str = "1d") -> list[dict]:
+        """Fetch real OHLC history for GC=F (Yahoo chart API).
+
+        Daily: range "2y", interval "1d" (~500 bars). Intraday:
+        range "5d", interval "15m". Raises ConnectorError on failure —
+        the caller stores nothing and reports the error.
+        """
+        data = self._get_json(YAHOO_CHART_URL.format(symbol=SYMBOLS[0]),
+                              params={"range": range_, "interval": interval})
+        return self.parse_history(data, interval)

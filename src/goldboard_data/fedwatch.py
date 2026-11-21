@@ -5,10 +5,12 @@ NOT Fed guidance. The free web tool is not an API and is never scraped
 or faked. The supported route is the CME FedWatch End-of-Day API
 ($25/month, REST/JSON, history back to 2015):
   https://www.cmegroup.com/market-data/market-data-api/fedwatch-api.html
-It needs a key (env GOLD_BOARD_FEDWATCH_KEY) and the endpoint URL
-(env GOLD_BOARD_FEDWATCH_URL — the exact endpoint path is set from the
-CME API page; no endpoint is guessed here). Without a key, fetch()
-raises ConnectorError: "FedWatch API key required ($25/mo EOD API)".
+It needs a key (env GOLD_BOARD_FEDWATCH_KEY, or the Settings page which
+saves it to the config file) and the endpoint URL (env
+GOLD_BOARD_FEDWATCH_URL, or the Settings page — the exact endpoint path
+is set from the CME API page; no endpoint is guessed here). Without a
+key, fetch() raises ConnectorError: "FedWatch API key required
+($25/mo EOD API)".
 
 FOMC calendar: NOTHING is hard-coded as live. ``next_meetings()`` reads
 ``data/fomc_calendar.json`` — a small, manually-maintained calendar file
@@ -89,8 +91,19 @@ class FedWatchConnector(BaseConnector):
     def __init__(self, api_key: str | None = None,
                  endpoint: str | None = None, **kw) -> None:
         super().__init__(**kw)
+        # Env first, then the config file (Settings page), then nothing.
         self.api_key = api_key or os.environ.get("GOLD_BOARD_FEDWATCH_KEY")
         self.endpoint = endpoint or os.environ.get("GOLD_BOARD_FEDWATCH_URL")
+        if not self.api_key or not self.endpoint:
+            try:
+                from goldboard_core.config import load_config
+                cfg = load_config()
+                if not self.api_key:
+                    self.api_key = cfg.fedwatch_api_key or None
+                if not self.endpoint:
+                    self.endpoint = cfg.fedwatch_api_url or None
+            except Exception:
+                pass
 
     def parse(self, raw) -> list:
         """Parse FedWatch EOD JSON into per-meeting probability snapshots.

@@ -60,7 +60,15 @@ class FREDConnector(BaseConnector):
 
     def __init__(self, api_key: str | None = None, **kw) -> None:
         super().__init__(**kw)
+        # Env first, then the config file (Settings page), then keyless
+        # CSV fallback.
         self.api_key = api_key or os.environ.get("GOLD_BOARD_FRED_KEY")
+        if not self.api_key:
+            try:
+                from goldboard_core.config import load_config
+                self.api_key = load_config().fred_api_key or None
+            except Exception:
+                pass
 
     # -- parsing ------------------------------------------------------
     def parse(self, raw) -> list:

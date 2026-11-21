@@ -1,6 +1,9 @@
 """SQLite storage (stdlib sqlite3 only). No invented data.
 
-Tables: snapshots, scores, signals, shadow_trades, gates, events, meta.
+Tables: snapshots, scores, signals, shadow_trades, gates, events, meta,
+price_history (real OHLC bars fetched from Yahoo — the chart and the
+history backtest read these, never invented prices), news (real
+headlines fetched from GDELT ArtList / Finnhub — titles + URLs only).
 All datetimes are stored as ISO-8601 strings; statuses, source URLs and
 proxy flags are stored with every snapshot so nothing is ever presented
 without provenance.
@@ -10,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import (
@@ -106,6 +109,32 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS price_history (
+    ts TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume REAL,
+    interval TEXT NOT NULL DEFAULT '1d',
+    fetched_at TEXT,
+    PRIMARY KEY (ts, interval)
+);
+CREATE INDEX IF NOT EXISTS idx_price_history_interval_ts
+    ON price_history (interval, ts);
+
+CREATE TABLE IF NOT EXISTS news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    fetched_at TEXT,
+    provider TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_news_published
+    ON news (published_at DESC);
 """
 
 
@@ -529,3 +558,127 @@ def get_meta(db_path: str | Path, key: str) -> str | None:
     with _connect(db_path) as conn:
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else None
+
+
+# ------------------------------------------------------------ price history
+
+def save_price_bars(db_path: str | Path, bars: list[dict]) -> int:
+    """Upsert OHLC bars (by ts + interval); returns rows written.
+
+    ``bars``: dicts with ts (ISO str or datetime), open/high/low/close,
+    optional volume, interval ('1d' or '15m'). Bars come only from the
+    Yahoo chart API (see goldboard_data.price) — never invented.
+    """
+    if not bars:
+        return 0
+    init_db(db_path)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for bar in bars:
+        ts = bar.get("ts")
+        ts_text = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+        rows.append((
+            ts_text,
+            float(bar["open"]), float(bar["high"]),
+            float(bar["low"]), float(bar["close"]),
+            None if bar.get("volume") is None else float(bar["volume"]),
+            str(bar.get("interval", "1d")),
+            fetched_at,
+        ))
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """INSERT INTO price_history
+               (ts, open, high, low, close, volume, interval, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ts, interval) DO UPDATE SET
+                 open = excluded.open, high = excluded.high,
+                 low = excluded.low, close = excluded.close,
+                 volume = excluded.volume, fetched_at = excluded.fetched_at""",
+            rows,
+        )
+    return len(rows)
+
+
+def get_price_bars(
+    db_path: str | Path, interval: str = "1d", limit: int = 600
+) -> list[dict]:
+    """Oldest→newest OHLC bars for one interval (empty list if none)."""
+    if not Path(db_path).is_file():
+        return []
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT ts, open, high, low, close, volume, interval
+               FROM price_history WHERE interval = ?
+               ORDER BY ts ASC LIMIT ?""",
+            (interval, limit),
+        ).fetchall()
+    return [
+        {
+            "ts": _parse(r["ts"]),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+            "volume": None if r["volume"] is None else float(r["volume"]),
+            "interval": r["interval"],
+        }
+        for r in rows
+    ]
+
+
+# --------------------------------------------------------------------- news
+
+def save_news(db_path: str | Path, items: list[dict]) -> int:
+    """Insert headlines (dedupe by title+url); returns rows written."""
+    if not items:
+        return 0
+    init_db(db_path)
+    written = 0
+    with _connect(db_path) as conn:
+        for item in items:
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not title:
+                continue
+            published = item.get("published_at")
+            published_text = (
+                published.isoformat() if isinstance(published, datetime)
+                else (str(published) if published else None))
+            cur = conn.execute(
+                """INSERT INTO news
+                   (title, url, source, published_at, fetched_at, provider)
+                   SELECT ?, ?, ?, ?, ?, ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM news WHERE title = ? AND url = ?)""",
+                (
+                    title, url, str(item.get("source") or ""),
+                    published_text, _iso(datetime.now(timezone.utc)),
+                    str(item.get("provider") or ""),
+                    title, url,
+                ),
+            )
+            written += cur.rowcount
+    return written
+
+
+def get_latest_news(db_path: str | Path, limit: int = 30) -> list[dict]:
+    """Newest-first headlines (empty list if none stored)."""
+    if not Path(db_path).is_file():
+        return []
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT title, url, source, published_at, provider
+               FROM news ORDER BY
+                 COALESCE(published_at, fetched_at) DESC, id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "title": r["title"],
+            "url": r["url"] or "",
+            "source": r["source"] or "",
+            "published_at": _parse(r["published_at"]),
+            "provider": r["provider"] or "",
+        }
+        for r in rows
+    ]
