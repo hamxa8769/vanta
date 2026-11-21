@@ -8,6 +8,11 @@ Skipped with a clear reason when PySide6 is not installed.
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# QtWebEngine's Chromium refuses to start as root without this flag.
+# The CI runners are not root, but local/VM runs are — setdefault so a
+# deliberate outer value still wins. (Windows users never hit this.)
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                      "--no-sandbox --disable-gpu")
 
 from datetime import datetime, timezone
 
@@ -340,3 +345,106 @@ def test_no_refresh_starts_after_window_close(tmp_path, monkeypatch, qapp):
     QTest.qWait(1500)
     qapp.processEvents()
     assert calls == []
+
+
+def _open_window(tmp_path, monkeypatch, qapp):
+    """Window with the background refresh stubbed out (offline)."""
+    monkeypatch.setattr("goldboard_app.worker.refresh_all", lambda db_path: {})
+    monkeypatch.setattr("goldboard_app.worker._fetch_history", lambda *a: None)
+    monkeypatch.setattr("goldboard_app.worker._fetch_news", lambda *a: None)
+    db = tmp_path / "goldboard.db"
+    _seed_db(db)
+    window = MainWindow(db_path=db, enable_live_ticker=False)
+    window.show()
+    qapp.processEvents()
+    return window
+
+
+def test_update_button_always_visible(tmp_path, monkeypatch, qapp):
+    """v0.4.0: the update button is visible from the start — before
+    v0.4.0 it only appeared after a successful check found a newer
+    release, so a failed check left the user with no button at all."""
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    assert window._update_button.isVisible()
+    assert window._update_button.text() in (
+        "Check for updates", "Checking…", "✓ Up to date")
+    # Up-to-date state keeps the button visible.
+    window._on_update_checked(None, None)
+    assert window._update_button.isVisible()
+    assert window._update_button.text() == "✓ Up to date"
+    # A newer release turns it into the gold update button.
+    window._on_update_checked(
+        {"version": "9.9.9", "html_url": "https://example.invalid"}, None)
+    assert window._update_button.isVisible()
+    assert "9.9.9" in window._update_button.text()
+    assert window._pending_update["version"] == "9.9.9"
+    window.close()
+
+
+def test_panels_menu_hides_and_restores(tmp_path, monkeypatch, qapp):
+    """v0.4.0: hiding a panel from the Panels menu removes it from
+    the grid and remembers the choice in QSettings."""
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    assert window._panels_button is not None
+    assert window._panels_menu is not None
+    news_box = next(p["box"] for p in window._panels
+                    if p["key"] == "news")
+    assert news_box.isVisible()
+    window._toggle_panel("news", False)
+    qapp.processEvents()
+    assert not news_box.isVisible()
+    assert window.settings.value("panels/news", True, type=bool) is False
+    assert all(p["box"] is not news_box
+               for p in window._panels
+               if window._panel_visible.get(p["key"], True))
+    window._toggle_panel("news", True)
+    qapp.processEvents()
+    assert news_box.isVisible()
+    assert window.settings.value("panels/news", False, type=bool) is True
+    window.close()
+
+
+def test_volume_profile_and_events_panels_render(tmp_path, monkeypatch, qapp):
+    """v0.4.0: a refresh payload with a volume profile and events
+    renders both new panels."""
+    from goldboard_core.volume_profile import volume_profile
+
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    bars = [{"open": 3500.0 + i, "high": 3502.0 + i, "low": 3498.0 + i,
+             "close": 3500.0 + i, "volume": 10.0 if i % 2 else 1.0}
+            for i in range(40)]
+    payload = {
+        "snapshots": {}, "scores": {}, "total_score": None,
+        "signal": None, "gates": {}, "cot_history": [],
+        "price_bars_daily": bars, "price_bars_intraday": bars,
+        "technical": {}, "setups": [],
+        "volume_profile": volume_profile(bars),
+        "events": [{"name": "US PCE inflation (Oct)", "date": "2026-11-25",
+                    "days_away": 3,
+                    "impact": "Hot PCE -> gold pressured."}],
+        "errors": [],
+    }
+    window._on_refresh_finished(payload)
+    qapp.processEvents()
+    assert window._volume_widget._profile.get("complete") is True
+    assert "POC" in window._volume_label.text()
+    assert "US PCE" in window._events_list.item(0).text()
+    assert "PCE" in window._events_label.text()
+    window.close()
+
+
+def test_tradingview_chart_falls_back_without_webengine(monkeypatch, qapp):
+    """v0.4.0: without PySide6-WebEngine the chart widget shows the
+    built-in chart instead of a blank panel."""
+    import goldboard_app.tradingview_chart as tvc
+    from PySide6.QtWidgets import QLabel
+
+    from goldboard_app.tradingview_chart import TradingViewChart
+
+    monkeypatch.setattr(tvc, "WEBENGINE_AVAILABLE", False)
+    fallback = QLabel("built-in chart")
+    chart = TradingViewChart(fallback)
+    assert chart.currentWidget() is fallback
+    assert chart.is_live is False
+    chart.show_fallback()
+    assert chart.currentWidget() is fallback

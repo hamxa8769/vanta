@@ -1,2 +1,3 @@
 requests>=2.32
 PySide6>=6.7
+PySide6-WebEngine>=6.7

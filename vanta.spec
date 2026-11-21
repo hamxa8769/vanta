@@ -27,6 +27,9 @@ datas += [
     # FOMC calendar: read at runtime by goldboard_data.fedwatch; without
     # this the frozen app reports "data/fomc_calendar.json not found".
     (str(SPEC_DIR / "data" / "fomc_calendar.json"), "data"),
+    # Macro event calendar (PCE / jobs / FOMC) for the v0.4.0
+    # Live Research Engine panel.
+    (str(SPEC_DIR / "data" / "macro_events.json"), "data"),
 ]
 hiddenimports += [
     "goldboard_core",
@@ -34,14 +37,21 @@ hiddenimports += [
     "goldboard_core.branding",
     "goldboard_core.config",
     "goldboard_core.gates",
+    "goldboard_core.indicators",
     "goldboard_core.models",
     "goldboard_core.scoring",
+    "goldboard_core.setups",
     "goldboard_core.signals",
     "goldboard_core.storage",
+    "goldboard_core.technical",
+    "goldboard_core.volume_profile",
     "goldboard_data",
+    "goldboard_data.events",
+    "goldboard_data.price_sources",
     "goldboard_data.registry",
     "goldboard_app",
     "goldboard_app.main_window",
+    "goldboard_app.tradingview_chart",
     "goldboard_app.updater",
     "goldboard_app.worker",
 ]

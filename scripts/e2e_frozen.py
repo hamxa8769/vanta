@@ -1,10 +1,10 @@
-"""Frozen e2e check for v0.3.0 (NOT a pytest test).
+"""Frozen e2e check for v0.4.0 (NOT a pytest test).
 
 Launches the frozen dist/Vanta/Vanta binary headless (offscreen)
 with an isolated HOME for ~180s, then inspects the DB it wrote:
 price bars (daily + intraday), snapshots per source, and recomputes
-the technical summary + setups from the stored real bars to prove
-the new v0.3.0 panels have real data behind them.
+the technical summary + setups + volume profile from the stored
+real bars to prove the new v0.4.0 panels have real data behind them.
 
 Usage: python scripts/e2e_frozen.py [seconds]
 """
@@ -31,6 +31,10 @@ def main() -> int:
     env["HOME"] = str(home)
     env["QT_QPA_PLATFORM"] = "offscreen"
     env["XDG_CONFIG_HOME"] = str(home / ".config")
+    # Chromium refuses to start as root without this (test-only flag;
+    # Windows users never hit it).
+    env.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                   "--no-sandbox --disable-gpu --ignore-certificate-errors")
     print(f"HOME={home}  running frozen Vanta for {seconds}s ...")
     proc = subprocess.Popen([str(BIN)], env=env,
                             stdout=subprocess.DEVNULL,
@@ -43,11 +47,28 @@ def main() -> int:
         proc.kill()
         proc.wait()
     print(f"exit code: {proc.returncode}")
-    dbs = list(home.rglob("*.db")) + list(home.rglob("*.sqlite*"))
+    dbs = [p for p in home.rglob("*.db") if ".pki" not in p.parts]
     if not dbs:
         print("NO DATABASE FOUND under isolated HOME")
         return 1
-    db = dbs[0]
+    # Chromium (QtWebEngine) writes its own .db files too — pick the
+    # one that actually holds Vanta's price_history table.
+    db = None
+    for candidate in dbs:
+        try:
+            probe = sqlite3.connect(str(candidate))
+            tables = {r[0] for r in probe.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            probe.close()
+        except sqlite3.Error:
+            continue
+        if "price_history" in tables:
+            db = candidate
+            break
+    if db is None:
+        print(f"NO Vanta DB among {len(dbs)} .db files: "
+              + ", ".join(str(p.relative_to(home)) for p in dbs))
+        return 1
     print(f"DB: {db}")
     con = sqlite3.connect(str(db))
     tables = {r[0] for r in con.execute(
@@ -73,6 +94,8 @@ def main() -> int:
     from goldboard_core.storage import get_price_bars
     from goldboard_core.technical import technical_summary
     from goldboard_core.setups import generate_setups
+    from goldboard_core.volume_profile import volume_profile
+    from goldboard_data.events import next_event, upcoming_events
     daily = get_price_bars(str(db), "1d", limit=600)
     intra = get_price_bars(str(db), "15m", limit=500)
     tech = technical_summary(daily, intra)
@@ -84,10 +107,24 @@ def main() -> int:
                   else None),
         "adx": (round(tech["adx"], 1) if tech["adx"] is not None else None),
     })
-    setups = generate_setups(tech, None, None, None, None, daily)
+    nxt = next_event()
+    setups = generate_setups(tech, None, None, None, None, daily, nxt)
     print(f"setups ({len(setups)}):")
     for s in setups:
         print(f"  - {s['name']} [{s['direction']}/{s['confidence']}]")
+    profile = volume_profile(intra)
+    print("volume profile:", {
+        "complete": profile["complete"],
+        "poc": (round(profile["poc"], 2) if profile.get("poc") else None),
+        "value_area": ((round(profile["value_area_low"], 2),
+                        round(profile["value_area_high"], 2))
+                       if profile.get("complete") else None),
+        "reason": profile.get("reason") or "",
+    })
+    events = upcoming_events(days=60)
+    print(f"events (next 60d: {len(events)}):")
+    for e in events:
+        print(f"  - {e['name']} in {e['days_away']}d ({e['date']})")
     return 0
 
 

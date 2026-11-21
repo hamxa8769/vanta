@@ -19,6 +19,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QDesktopServices,
     QFont,
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -65,6 +67,7 @@ from goldboard_core.gates import GATE_THRESHOLDS
 from goldboard_data.fedwatch import load_fomc_calendar, next_meetings
 
 from . import __version__
+from .tradingview_chart import TradingViewChart
 from .updater import (
     NO_CHANNEL_MESSAGE,
     check_for_update_live,
@@ -308,6 +311,74 @@ class PriceChart(QWidget):
         painter.drawText(pad_l, height - 8, 300, 12, Qt.AlignLeft,
                          f"{len(bars)} bars ({interval})"
                          + ("  ·  LIVE" if self._live_tick else ""))
+
+
+class VolumeProfileWidget(QWidget):
+    """Horizontal volume profile: volume per price bin (POC in gold,
+    value area shaded). Built from stored intraday bars — no tick
+    data needed; true bid/ask footprint is NOT shown here (paid CME
+    tick data) and the panel says so."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._profile: dict = {}
+        self.setMinimumHeight(170)
+
+    def set_profile(self, profile: dict) -> None:
+        self._profile = profile or {}
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width, height = self.width(), self.height()
+        profile = self._profile
+        bins = profile.get("bins") or []
+        if not profile.get("complete") or not bins:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(0, 0, width, height, Qt.AlignCenter,
+                             profile.get("reason") or
+                             "No volume profile yet — refresh to fetch "
+                             "intraday history.")
+            return
+        max_vol = max(b["volume"] for b in bins) or 1.0
+        pad_l, pad_r, pad_t, pad_b = 64, 8, 8, 8
+        plot_w = width - pad_l - pad_r
+        plot_h = height - pad_t - pad_b
+        row_h = plot_h / len(bins)
+        va_lo = profile.get("value_area_low")
+        va_hi = profile.get("value_area_high")
+        poc = profile.get("poc")
+        for i, b in enumerate(bins):
+            # Bins are low→high; draw high price at the top.
+            j = len(bins) - 1 - i
+            y = pad_t + j * row_h
+            bar_w = plot_w * (b["volume"] / max_vol)
+            mid = b["mid"]
+            in_va = (va_lo is not None and va_hi is not None
+                     and va_lo <= mid <= va_hi)
+            half_bin = ((bins[1]["mid"] - bins[0]["mid"]) / 2
+                        if len(bins) > 1 else 0.0)
+            is_poc = poc is not None and abs(mid - poc) < half_bin
+            if is_poc:
+                painter.setBrush(QColor(PALETTE["gold"]))
+            elif in_va:
+                painter.setBrush(QColor("#8a6d2b"))
+            else:
+                painter.setBrush(QColor("#3A3A3C"))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(int(pad_l), int(y) + 1,
+                             max(1, int(bar_w)), max(1, int(row_h) - 2))
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.setFont(_font(9))
+            painter.drawText(0, int(y), pad_l - 4, int(row_h),
+                             Qt.AlignRight | Qt.AlignVCenter,
+                             f"{mid:,.0f}")
+        painter.setPen(QColor(PALETTE["muted"]))
+        painter.setFont(_font(9))
+        painter.drawText(pad_l, height - pad_b - 2, plot_w, 12,
+                         Qt.AlignLeft,
+                         "gold = POC · shaded = value area (70% of volume)")
 
 
 # ------------------------------------------------------------- update threads
@@ -672,10 +743,6 @@ class MainWindow(QMainWindow):
         return f"""
         QMainWindow, QWidget {{ background-color: {PALETTE["black"]};
             color: {PALETTE["text"]}; font-size: 13px; }}
-        QGroupBox {{ border: 1px solid {PALETTE["gold"]}; border-radius: 6px;
-            margin-top: 12px; padding: 10px; background: {PALETTE["surface"]}; }}
-        QGroupBox::title {{ color: {PALETTE["gold"]}; subcontrol-origin: margin;
-            left: 8px; padding: 0 4px; font-weight: bold; }}
         QLabel {{ color: {PALETTE["text"]}; background: transparent; }}
         QLabel.muted {{ color: {PALETTE["muted"]}; }}
         QPushButton {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
@@ -684,6 +751,16 @@ class MainWindow(QMainWindow):
         QPushButton:disabled {{ background: #3A3A3C; color: {PALETTE["muted"]}; }}
         QPushButton.ghost {{ background: transparent; color: {PALETTE["gold"]};
             border: 1px solid {PALETTE["gold"]}; }}
+        QPushButton.ghost:hover {{ background: #2a2415; }}
+        QPushButton.gold {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
+            border: none; }}
+        QMenu {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
+            border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 4px; }}
+        QMenu::item:selected {{ background: #2a2415; }}
+        QGroupBox {{ border: 1px solid #3d3420; border-radius: 8px;
+            margin-top: 12px; padding: 12px; background: {PALETTE["surface"]}; }}
+        QGroupBox::title {{ color: {PALETTE["gold"]}; subcontrol-origin: margin;
+            left: 8px; padding: 0 4px; font-weight: bold; }}
         QSpinBox {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 3px; }}
         QLineEdit {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
@@ -705,14 +782,23 @@ class MainWindow(QMainWindow):
         if not logo_path.is_file():
             from goldboard_core.branding import get_app_logo_path
             logo_path = get_app_logo_path()
+        # Logo in a visible tile: the PNG is a gold ring on black, so
+        # on the near-black header it was invisible without a border.
         logo = QLabel(header)
+        logo.setFixedSize(48, 48)
+        logo.setStyleSheet(
+            f"border: 1px solid {PALETTE['gold']}; border-radius: 10px; "
+            "background-color: #0a0a0a; padding: 2px;")
         if logo_path is not None and Path(logo_path).is_file():
             pix = QPixmap(str(logo_path)).scaled(
-                44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo.setPixmap(pix)
         else:
             logo.setText("◆")
-            logo.setStyleSheet(f"color: {PALETTE['gold']}; font-size: 28px;")
+            logo.setStyleSheet(
+                f"color: {PALETTE['gold']}; font-size: 28px; "
+                f"border: 1px solid {PALETTE['gold']}; border-radius: 10px;")
+        logo.setAlignment(Qt.AlignCenter)
         layout.addWidget(logo)
         title = QLabel(f"{APP_DISPLAY_NAME}", header)
         title.setFont(_font(20, bold=True))
@@ -733,10 +819,19 @@ class MainWindow(QMainWindow):
         self._settings_button.setProperty("class", "ghost")
         self._settings_button.clicked.connect(self._open_settings)
         layout.addWidget(self._settings_button)
-        self._update_button = QPushButton("Update available", header)
-        self._update_button.setVisible(False)
+        # Update button is ALWAYS visible now: before v0.4.0 it only
+        # appeared after a successful check found a newer release, so
+        # a failed or pre-release check left the user with no button
+        # at all. Clicking it with no pending update re-checks.
+        self._update_button = QPushButton("Check for updates", header)
+        self._update_button.setProperty("class", "ghost")
         self._update_button.clicked.connect(self._on_update_button)
         layout.addWidget(self._update_button)
+        self._panels_button = QPushButton("Panels ▾", header)
+        self._panels_button.setProperty("class", "ghost")
+        self._panels_menu = QMenu(self)
+        self._panels_button.setMenu(self._panels_menu)
+        layout.addWidget(self._panels_button)
         self._alerts_check = QCheckBox("Signal alerts", header)
         self._alerts_check.setChecked(
             self.settings.value("alerts_enabled", True, type=bool))
@@ -757,14 +852,79 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         return box, layout
 
+    # Panels the user can hide/show from the header "Panels" menu.
+    # The choice is remembered in QSettings, so a hidden panel stays
+    # hidden across restarts. Freshness is hidden by default — it is
+    # the noisiest panel and the board stays usable without it.
+    _PANEL_DEFAULTS = {"freshness": False}
+
+    def _register_panel(self, key: str, box: QGroupBox,
+                        wide: bool = False) -> None:
+        visible = self.settings.value(
+            f"panels/{key}",
+            self._PANEL_DEFAULTS.get(key, True), type=bool)
+        self._panels.append({"key": key, "box": box, "wide": wide})
+        # Track visibility in a dict, not box.isVisible(): during
+        # __init__ the window is not shown yet, so isVisible() is
+        # False for every panel and the relayout would add nothing.
+        self._panel_visible[key] = bool(visible)
+        box.setVisible(bool(visible))
+
+    def _relayout_panels(self) -> None:
+        """Re-flow the visible panels in order, 3 per row."""
+        grid = self._grid
+        while grid.count():
+            grid.takeAt(0)
+        row, col = 0, 0
+        for panel in self._panels:
+            if not self._panel_visible.get(panel["key"], True):
+                continue
+            box = panel["box"]
+            if panel["wide"]:
+                if col:
+                    row += 1
+                    col = 0
+                grid.addWidget(box, row, 0, 1, 3)
+                row += 1
+            else:
+                grid.addWidget(box, row, col)
+                col += 1
+                if col == 3:
+                    col = 0
+                    row += 1
+
+    def _build_panels_menu(self) -> None:
+        self._panels_menu.clear()
+        for panel in self._panels:
+            action = QAction(panel["box"].title(), self)
+            action.setCheckable(True)
+            action.setChecked(self._panel_visible.get(panel["key"], True))
+            key = panel["key"]
+            action.triggered.connect(
+                lambda checked=False, k=key: self._toggle_panel(k, checked))
+            self._panels_menu.addAction(action)
+
+    def _toggle_panel(self, key: str, visible: bool) -> None:
+        for panel in self._panels:
+            if panel["key"] == key:
+                self.settings.setValue(f"panels/{key}", bool(visible))
+                self._panel_visible[key] = bool(visible)
+                panel["box"].setVisible(bool(visible))
+                break
+        self._relayout_panels()
+        self._build_panels_menu()
+
     def _build_panels(self) -> None:
+        self._panels: list[dict] = []
+        self._panel_visible: dict[str, bool] = {}
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         content = QWidget(scroll)
         grid = QGridLayout(content)
+        self._grid = grid
 
-        # (1) Gold price + live chart.
-        box, layout = self._panel("Gold price (XAUUSD) — LIVE")
+        # (1) Gold price + TradingView chart.
+        box, layout = self._panel("Gold price (XAUUSD) — LIVE · TradingView")
         self._price_value = QLabel("—", content)
         self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._price_value.setFont(_font(22, bold=True))
@@ -775,7 +935,15 @@ class MainWindow(QMainWindow):
         self._price_source.setProperty("class", "muted")
         self._price_source.setWordWrap(True)
         self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Real TradingView candlestick chart; the built-in chart is the
+        # fallback when TradingView cannot load (offline / blocked).
         self._price_chart = PriceChart(content)
+        self._tv_chart = TradingViewChart(self._price_chart, content)
+        tv_note = QLabel(
+            "TradingView chart (live candles) — if it stays blank, the "
+            "built-in chart takes over automatically.", content)
+        tv_note.setProperty("class", "muted")
+        tv_note.setWordWrap(True)
         range_row = QHBoxLayout()
         self._range_buttons: dict[str, QPushButton] = {}
         for label in ("1D", "5D", "1M", "1Y", "2Y"):
@@ -791,10 +959,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._price_value)
         layout.addWidget(self._price_change)
         layout.addWidget(self._price_source)
-        layout.addWidget(self._price_chart)
+        layout.addWidget(self._tv_chart)
+        layout.addWidget(tv_note)
         layout.addLayout(range_row)
         layout.addStretch(1)
-        grid.addWidget(box, 0, 0)
+        self._register_panel("price", box)
 
         # (2) Total score gauge + components.
         box, layout = self._panel("Total score")
@@ -808,7 +977,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._gauge)
         layout.addWidget(self._score_value)
         layout.addWidget(self._components_list)
-        grid.addWidget(box, 0, 1)
+        self._register_panel("score", box)
 
         # (3) COT chart.
         box, layout = self._panel("COT — managed-money net (contracts)")
@@ -818,7 +987,7 @@ class MainWindow(QMainWindow):
         self._cot_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._cot_chart)
         layout.addWidget(self._cot_summary)
-        grid.addWidget(box, 0, 2)
+        self._register_panel("cot", box)
 
         # (4) ETF flow.
         box, layout = self._panel("ETF flow — GLD / IAU")
@@ -827,7 +996,7 @@ class MainWindow(QMainWindow):
         self._etf_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._etf_label)
         layout.addStretch(1)
-        grid.addWidget(box, 1, 0)
+        self._register_panel("etf", box)
 
         # (5) Central-bank buying.
         box, layout = self._panel("Central-bank buying")
@@ -840,7 +1009,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._cb_label)
         layout.addWidget(note)
         layout.addStretch(1)
-        grid.addWidget(box, 1, 1)
+        self._register_panel("central_bank", box)
 
         # (6) Macro.
         box, layout = self._panel("Macro — rates / USD / Fed")
@@ -849,7 +1018,7 @@ class MainWindow(QMainWindow):
         self._macro_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._macro_label)
         layout.addStretch(1)
-        grid.addWidget(box, 1, 2)
+        self._register_panel("macro", box)
 
         # (7) News / sentiment — live headlines (click to open).
         box, layout = self._panel("Live news & sentiment")
@@ -864,7 +1033,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._news_label)
         layout.addWidget(self._news_list)
         layout.addStretch(1)
-        grid.addWidget(box, 2, 0)
+        self._register_panel("news", box)
 
         # (8) Signals.
         box, layout = self._panel("Signals (advisory, shadow only)")
@@ -877,7 +1046,7 @@ class MainWindow(QMainWindow):
         self._signal_list.setMinimumHeight(120)
         layout.addWidget(self._signal_label)
         layout.addWidget(self._signal_list)
-        grid.addWidget(box, 2, 1)
+        self._register_panel("signals", box)
 
         # (9) Gates.
         box, layout = self._panel("Validation gates G0–G8")
@@ -891,7 +1060,7 @@ class MainWindow(QMainWindow):
         self._gates_list.setMinimumHeight(120)
         layout.addWidget(self._gates_banner)
         layout.addWidget(self._gates_list)
-        grid.addWidget(box, 2, 2)
+        self._register_panel("gates", box)
 
         # (10) Data freshness.
         box, layout = self._panel("Data freshness")
@@ -900,7 +1069,7 @@ class MainWindow(QMainWindow):
         self._freshness_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._freshness_list.setMinimumHeight(150)
         layout.addWidget(self._freshness_list)
-        grid.addWidget(box, 3, 0, 1, 3)
+        self._register_panel("freshness", box, wide=True)
 
         # (11) History backtest.
         box, layout = self._panel("Backtest on history (real OHLC)")
@@ -917,7 +1086,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._backtest_label)
         layout.addLayout(bt_row)
         layout.addStretch(1)
-        grid.addWidget(box, 4, 0, 1, 3)
+        self._register_panel("backtest", box, wide=True)
 
         # (12) Technical summary + setups — computed locally from
         # stored Yahoo history (free; Finnhub's aggregate endpoint
@@ -935,11 +1104,49 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._technical_label)
         layout.addWidget(self._setups_list)
         layout.addStretch(1)
-        grid.addWidget(box, 5, 0, 1, 3)
+        self._register_panel("technical", box, wide=True)
+
+        # (13) Volume Profile — where trading actually happened (free,
+        # from stored intraday bars). True bid/ask footprint needs paid
+        # CME tick data and is NOT claimed here.
+        box, layout = self._panel("Volume profile — where trading happened")
+        self._volume_widget = VolumeProfileWidget(content)
+        self._volume_label = QLabel(
+            "No volume profile yet — refresh to fetch intraday history.",
+            content)
+        self._volume_label.setWordWrap(True)
+        self._volume_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        foot_note = QLabel(
+            "From stored 15-minute bars. True bid/ask footprint needs "
+            "paid CME tick data — this is volume-at-price, not footprint.",
+            content)
+        foot_note.setProperty("class", "muted")
+        foot_note.setWordWrap(True)
+        layout.addWidget(self._volume_widget)
+        layout.addWidget(self._volume_label)
+        layout.addWidget(foot_note)
+        layout.addStretch(1)
+        self._register_panel("volume", box)
+
+        # (14) Macro event calendar — the Live Research Engine diary.
+        box, layout = self._panel("Macro events — what is next (PCE / jobs / FOMC)")
+        self._events_label = QLabel("No events in the calendar yet.", content)
+        self._events_label.setWordWrap(True)
+        self._events_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._events_list = QListWidget(content)
+        self._events_list.setWordWrap(True)
+        self._events_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._events_list.setMinimumHeight(120)
+        layout.addWidget(self._events_label)
+        layout.addWidget(self._events_list)
+        layout.addStretch(1)
+        self._register_panel("events", box)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
+        self._relayout_panels()
+        self._build_panels_menu()
         content.setLayout(grid)
         scroll.setWidget(content)
 
@@ -1397,6 +1604,53 @@ class MainWindow(QMainWindow):
         if not payload.get("setups"):
             self._setups_list.addItem(QListWidgetItem(
                 "No setups yet — refresh to evaluate the rules."))
+        # Volume profile + macro event calendar.
+        profile = payload.get("volume_profile") or {}
+        self._volume_widget.set_profile(profile)
+        if profile.get("complete"):
+            last = self._live_tick.get("value") if self._live_tick else None
+            if last is None and payload.get("price_bars_daily"):
+                last = payload["price_bars_daily"][-1].get("close")
+            where = "—"
+            if last is not None:
+                if last > profile["value_area_high"]:
+                    where = "price ABOVE value area (accepted higher)"
+                elif last < profile["value_area_low"]:
+                    where = "price BELOW value area (accepted lower)"
+                else:
+                    where = "price INSIDE value area (balanced)"
+            self._volume_label.setText(
+                f"POC (most traded price): "
+                f"{profile['poc']:,.2f} USD/oz\n"
+                f"Value area (70% of volume): "
+                f"{profile['value_area_low']:,.2f} – "
+                f"{profile['value_area_high']:,.2f}\n"
+                f"{where}")
+        else:
+            self._volume_label.setText(
+                profile.get("reason") or
+                "No volume profile yet — refresh to fetch intraday history.")
+        events = payload.get("events") or []
+        self._events_list.clear()
+        if events:
+            nxt = events[0]
+            self._events_label.setText(
+                f"Next: {nxt.get('name', '')} — "
+                f"{nxt.get('days_away', '?')} day(s) away "
+                f"({nxt.get('date', '')}).")
+            for event in events:
+                days = event.get("days_away")
+                when = (f"in {days} day{'s' if days != 1 else ''}"
+                        if days is not None else str(event.get("date", "")))
+                self._events_list.addItem(QListWidgetItem(
+                    f"{event.get('name', '')} — {when}"))
+                if event.get("impact"):
+                    self._events_list.addItem(QListWidgetItem(
+                        f"   • {event['impact']}"))
+        else:
+            self._events_label.setText(
+                "No events in the calendar yet — the bundled list may be "
+                "out of date; check bea.gov / bls.gov / federalreserve.gov.")
 
     # ------------------------------------------------------------------ alerts
 
@@ -1431,14 +1685,24 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------------- updater
 
+    def _set_update_button_style(self, style_class: str) -> None:
+        """Change the update button's style class (needs a repolish)."""
+        self._update_button.setProperty("class", style_class)
+        self._update_button.style().unpolish(self._update_button)
+        self._update_button.style().polish(self._update_button)
+
     def check_for_updates(self) -> None:
         if self._update_thread is not None and self._update_thread.isRunning():
             return
+        self._update_button.setText("Checking…")
+        self._update_button.setEnabled(False)
         self._update_thread = UpdateCheckThread(__version__, self)
         self._update_thread.done.connect(self._on_update_checked)
         self._update_thread.start()
 
     def _on_update_checked(self, update: dict | None, error: str | None) -> None:
+        self._update_button.setEnabled(True)
+        self._set_update_button_style("ghost")
         if error is not None:
             if NO_CHANNEL_MESSAGE in error:
                 self.log("Updater: no release channel yet "
@@ -1447,13 +1711,19 @@ class MainWindow(QMainWindow):
                     "No release channel yet — repo hamxa8769/vanta not created.")
             else:
                 self.log(f"Updater: {error}")
+                self.statusBar().showMessage(
+                    "Update check failed — click the button to retry.")
+            self._update_button.setText("Check for updates")
             return
         if update is None:
             self.log("Updater: no newer release available.")
+            self._update_button.setText("✓ Up to date")
+            self.statusBar().showMessage(
+                f"Vanta v{__version__} is the latest release.")
             return
         self._pending_update = update
-        self._update_button.setText(f"Update available: v{update['version']}")
-        self._update_button.setVisible(True)
+        self._update_button.setText(f"⬆ Update available: v{update['version']}")
+        self._set_update_button_style("gold")
         self.log(f"Updater: v{update['version']} available "
                  f"({update.get('html_url') or ''}).")
         self.statusBar().showMessage(
@@ -1462,6 +1732,8 @@ class MainWindow(QMainWindow):
     def _on_update_button(self) -> None:
         update = self._pending_update
         if update is None:
+            # No update pending: the button is a manual re-check.
+            self.check_for_updates()
             return
         if not update.get("asset_url"):
             QMessageBox.information(

@@ -31,7 +31,8 @@ def _setup(name: str, direction: str, confidence: str,
 def generate_setups(technical: dict, score_total: float | None,
                     cot_pctile: float | None, etf_gld_change: float | None,
                     fomc_days_away: int | None,
-                    daily_bars: list[dict] | None = None) -> list[dict]:
+                    daily_bars: list[dict] | None = None,
+                    next_event: dict | None = None) -> list[dict]:
     """Evaluate the setup rules. Pure function — no I/O, no trading."""
     setups: list[dict] = []
     if not technical.get("complete"):
@@ -49,15 +50,27 @@ def generate_setups(technical: dict, score_total: float | None,
     score_dir = "long" if score >= 20 else "short" if score <= -20 else "none"
 
     # Event caution always fires first — it overrides nothing, it
-    # warns alongside any other setup.
-    if fomc_days_away is not None and fomc_days_away <= 2:
+    # warns alongside any other setup. Any macro event within 2 days
+    # counts (FOMC, PCE, jobs…), not just FOMC.
+    event_name = None
+    event_days = None
+    if next_event is not None and next_event.get("days_away") is not None \
+            and next_event["days_away"] <= 2:
+        event_name = str(next_event.get("name") or "macro event")
+        event_days = int(next_event["days_away"])
+    elif fomc_days_away is not None and fomc_days_away <= 2:
+        event_name = "FOMC"
+        event_days = fomc_days_away
+    if event_name is not None and event_days is not None:
+        reasons = [f"{event_name} within 2 days: ranges compress before "
+                   "the release and break after it — stand down or size "
+                   "down."]
+        if next_event is not None and next_event.get("impact"):
+            reasons.append(str(next_event["impact"]))
         setups.append(_setup(
-            "Event caution — FOMC in "
-            f"{fomc_days_away} day{'s' if fomc_days_away != 1 else ''}",
-            "none", "high",
-            ["FOMC decision within 2 days: ranges compress before the "
-             "decision and break after it — stand down or size down."],
-            "caution"))
+            f"Event caution — {event_name} in "
+            f"{event_days} day{'s' if event_days != 1 else ''}",
+            "none", "high", reasons, "caution"))
 
     # Conflict: technical and institutional score strongly disagree.
     tech_dir = ("long" if signal in ("buy", "strong buy") else

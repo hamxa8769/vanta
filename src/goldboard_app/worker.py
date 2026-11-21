@@ -40,6 +40,8 @@ from goldboard_core.storage import (
     set_meta,
 )
 from goldboard_core.technical import technical_summary
+from goldboard_core.volume_profile import volume_profile
+from goldboard_data.events import next_event, upcoming_events
 from goldboard_data.registry import refresh_all
 
 try:
@@ -234,6 +236,8 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         "price_bars_daily": [],
         "technical": {},
         "setups": [],
+        "volume_profile": {},
+        "events": [],
         "errors": [],
     }
 
@@ -350,10 +354,24 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
             payload["technical"], score_total,
             float(cot_snap.value) if cot_snap is not None else None,
             float(etf_snap.value) if etf_snap is not None else None,
-            fomc_days, payload["price_bars_daily"])
+            fomc_days, payload["price_bars_daily"],
+            next_event())
     except Exception as exc:
         payload["setups"] = []
         payload["errors"].append(f"setups failed: {exc!r}")
+    # Volume profile (free, from stored intraday bars) + the macro
+    # event calendar (Live Research Engine diary).
+    try:
+        payload["volume_profile"] = volume_profile(
+            payload["price_bars_intraday"])
+    except Exception as exc:
+        payload["volume_profile"] = {}
+        payload["errors"].append(f"volume profile failed: {exc!r}")
+    try:
+        payload["events"] = upcoming_events(days=60)
+    except Exception as exc:
+        payload["events"] = []
+        payload["errors"].append(f"events failed: {exc!r}")
     return payload
 
 

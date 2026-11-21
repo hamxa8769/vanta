@@ -150,8 +150,25 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.3.0**. Every release bumps the
+carry the same version. Current: **0.4.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.4.0 is the Live Research Engine + the modern dashboard. The chart
+is now the real TradingView candlestick chart (Advanced Real-Time
+Chart widget, OANDA:XAUUSD, dark theme, Volume study) inside the
+app, with the built-in chart as an automatic fallback when
+TradingView cannot load. A Volume Profile panel shows where trading
+actually happened (POC + 70% value area, from stored 15-minute
+bars — free; true bid/ask footprint needs paid CME tick data and is
+never claimed). A macro event calendar panel (PCE / jobs / FOMC with
+countdown + expected gold impact) feeds the setups engine, so event
+caution now fires for any macro event within 2 days, not just FOMC.
+Every panel can be hidden from the header "Panels" menu (choice
+remembered); the header logo sits in a visible gold-bordered tile
+(the black-on-black logo was invisible before), and the update button
+is always visible — "Check for updates", "✓ Up to date", or a gold
+"⬆ Update available: vX.Y.Z" — instead of appearing only after a
+successful check.
 
 v0.3.0 makes the advisor smarter, with its own algorithms — no
 premium key needed. Finnhub's Technical Indicator and Aggregate
