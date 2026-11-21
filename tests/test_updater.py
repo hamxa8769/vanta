@@ -107,6 +107,25 @@ def test_parse_sha256_text():
     assert parse_sha256_text("not a hash") is None
 
 
+def test_build_update_script_extracts_to_parent(tmp_path):
+    """v0.1.1: the release zip wraps files in a top-level Vanta/ folder,
+    so extraction must target the install dir's PARENT — extracting
+    into the install dir itself would nest Vanta/Vanta/ and never
+    replace the running exe (v0.1.0 updater bug)."""
+    install_dir = tmp_path / "Vanta-0.1.0-Windows" / "Vanta"
+    zip_path = tmp_path / "Vanta-0.1.1-Windows.zip"
+    script = build_update_script(install_dir, zip_path)
+    # The Expand-Archive destination must be the parent, not the dir itself.
+    expand_lines = [line for line in script.splitlines() if "Expand-Archive" in line]
+    assert len(expand_lines) == 1
+    # (The bat quotes the path as \"%EXTRACT_DIR%\" for PowerShell.)
+    assert "%EXTRACT_DIR%" in expand_lines[0]
+    assert "%INSTALL_DIR%" not in expand_lines[0]
+    assert f'set "EXTRACT_DIR={install_dir.parent}"' in script
+    # The restart target is still the exe inside the install dir.
+    assert str(install_dir / "Vanta.exe") in script
+
+
 def test_build_update_script_preserves_config_and_restarts(tmp_path):
     install_dir = tmp_path / "Vanta"
     zip_path = tmp_path / "Vanta-0.2.0-Windows.zip"

@@ -6,7 +6,12 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from .main_window import MainWindow
+# Absolute import (not relative): PyInstaller runs this file as a
+# top-level script ("main"), which has no parent package — a relative
+# import here crashed v0.1.0 on launch with "attempted relative import
+# with no known parent package". The package is on sys.path (pathex in
+# vanta.spec), so the absolute form works as a script and as a module.
+from goldboard_app.main_window import MainWindow
 
 
 def main(argv: list[str] | None = None) -> int:
