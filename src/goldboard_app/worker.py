@@ -27,6 +27,7 @@ from goldboard_core.api import get_features, get_score, get_signal
 from goldboard_core.backtest import backtest, split_backtest
 from goldboard_core.gates import evaluate_gates, ready_for_muuk
 from goldboard_core.replay import REPLAY_RULE_TEXT, generate_replay_signals
+from goldboard_core.setups import generate_setups
 from goldboard_core.storage import (
     get_latest_news,
     get_latest_snapshot_by_series,
@@ -38,6 +39,7 @@ from goldboard_core.storage import (
     save_price_bars,
     set_meta,
 )
+from goldboard_core.technical import technical_summary
 from goldboard_data.registry import refresh_all
 
 try:
@@ -230,6 +232,8 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         "news": [],
         "price_bars_intraday": [],
         "price_bars_daily": [],
+        "technical": {},
+        "setups": [],
         "errors": [],
     }
 
@@ -317,6 +321,39 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         payload["price_bars_daily"] = get_price_bars(db_path, "1d", limit=600)
     except Exception:
         payload["price_bars_daily"] = []
+    # Technical summary + setups: computed locally from the stored
+    # bars (free — no Finnhub premium needed). Advisory only; the
+    # frozen institutional score is untouched.
+    try:
+        payload["technical"] = technical_summary(
+            payload["price_bars_daily"], payload["price_bars_intraday"])
+    except Exception as exc:
+        payload["technical"] = {}
+        payload["errors"].append(f"technical summary failed: {exc!r}")
+    try:
+        score_total = (payload["score"].total
+                       if payload["score"] is not None else None)
+        cot_snap = payload["snapshots"].get(
+            "cot_managed_money_net_pctile_52w")
+        etf_snap = payload["snapshots"].get("etf_gld_daily_change_tonnes")
+        fomc_days = None
+        try:
+            from goldboard_data.fedwatch import next_meetings
+            meetings = next_meetings()
+            if meetings:
+                start = datetime.strptime(
+                    meetings[0]["start"], "%Y-%m-%d").date()
+                fomc_days = (start - datetime.now(timezone.utc).date()).days
+        except Exception:
+            fomc_days = None
+        payload["setups"] = generate_setups(
+            payload["technical"], score_total,
+            float(cot_snap.value) if cot_snap is not None else None,
+            float(etf_snap.value) if etf_snap is not None else None,
+            fomc_days, payload["price_bars_daily"])
+    except Exception as exc:
+        payload["setups"] = []
+        payload["errors"].append(f"setups failed: {exc!r}")
     return payload
 
 
@@ -341,13 +378,15 @@ if _QT_AVAILABLE:
             self.finished.emit(payload)
 
     class LivePriceWorker(QThread):  # type: ignore[misc]
-        """Polls the Yahoo quote every N seconds for the live ticker.
+        """Polls the best free live price every N seconds.
 
-        Short timeout (5s), no retries: one slow attempt must never
-        stall the loop. Emits price_updated {value, as_of, fetched_at}
-        or failed (keeps the last price on screen, never invents one).
-        Stop with stop() + wait(); the sleep is chunked so shutdown is
-        responsive.
+        Uses the multi-source aggregator (gold-api.com live spot
+        first, then Yahoo GC=F futures, metals.live, Stooq) with a
+        5s timeout and no retries: one slow source must never stall
+        the loop. Emits price_updated {value, as_of, fetched_at,
+        source, kind, diverged} or failed (keeps the last price on
+        screen, never invents one). Stop with stop() + wait(); the
+        sleep is chunked so shutdown is responsive.
         """
 
         price_updated = Signal(dict)  # type: ignore[assignment]
@@ -362,26 +401,25 @@ if _QT_AVAILABLE:
             self._stop = True
 
         def run(self) -> None:  # noqa: D102 — QThread entry point
-            from goldboard_data.price import (
-                YAHOO_CHART_URL,
-                PriceConnector,
-            )
+            from goldboard_data.price_sources import fetch_best_price
 
-            conn = PriceConnector()
             while not self._stop:
                 try:
-                    data = conn._get_json(
-                        YAHOO_CHART_URL.format(symbol="GC=F"),
-                        params={"range": "1d", "interval": "1d"},
-                        timeout=5, retries=0)
-                    snaps = conn.parse(data)
-                    snap = snaps[0]
+                    best = fetch_best_price()
                     self.price_updated.emit({
-                        "value": snap.value,
-                        "as_of": snap.as_of.isoformat() if snap.as_of else None,
-                        "fetched_at": snap.fetched_at.isoformat()
-                        if snap.fetched_at else _now_iso(),
+                        "value": best["value"],
+                        "as_of": best["as_of"].isoformat()
+                        if best["as_of"] else None,
+                        "fetched_at": _now_iso(),
+                        "source": best["source"],
+                        "kind": best["kind"],
+                        "diverged": best["diverged"],
                     })
+                    if best["diverged"]:
+                        self.failed.emit(
+                            "price sources disagree >1.5% (spot vs "
+                            "futures) — showing the spot price, check "
+                            "the log")
                 except Exception as exc:  # keep last price, report the miss
                     self.failed.emit(str(exc))
                 for _ in range(self.interval_seconds * 10):

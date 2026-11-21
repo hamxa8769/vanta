@@ -150,8 +150,25 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.2.0**. Every release bumps the
+carry the same version. Current: **0.3.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.3.0 makes the advisor smarter, with its own algorithms — no
+premium key needed. Finnhub's Technical Indicator and Aggregate
+Indicator endpoints are both premium-only, so Vanta computes the
+same read locally from its stored Yahoo history: RSI(14), MACD,
+SMA20/50/200, ADX(14) + trend regime, Bollinger %B, ATR(14), and an
+aggregate buy/neutral/sell summary shown in a new Technical Summary
+panel. A transparent setups rule engine runs over the technical
+summary + the institutional score (trend continuation, oversold /
+overbought bounce, Muuk-style range fade, breakout watch, FOMC event
+caution, and a conflict rule that says "no setup" when technical and
+institutions disagree) — every setup lists its reasons, and nothing
+is ever a trade order. The live ticker now uses a multi-source price
+aggregator (gold-api.com live spot first, then Yahoo GC=F futures,
+metals.live, Stooq daily close) with spot-consensus median and a
+divergence flag; the frozen institutional score and gates are
+untouched.
 
 v0.2.0 makes the board live: a Settings page (Finnhub/FRED/FedWatch
 keys with Test buttons + live intervals), a live price ticker (Yahoo

@@ -252,17 +252,20 @@ def test_run_history_backtest_on_seeded_bars(tmp_path):
 
 
 def test_live_price_worker_emits_ticks(tmp_path, monkeypatch, qapp):
-    """v0.2.0: ticker polls and emits quotes (network faked)."""
+    """v0.3.0: ticker polls the multi-source aggregator (network faked)."""
+    from datetime import datetime, timezone
+
     from goldboard_app.worker import LivePriceWorker
 
-    fake = {"chart": {"result": [{"meta": {
-        "regularMarketPrice": 3515.4,
-        "regularMarketTime": 1763750000, "symbol": "GC=F"}}],
-        "error": None}}
-
     monkeypatch.setattr(
-        "goldboard_data.price.PriceConnector._get_json",
-        lambda self, url, params=None, timeout=None, retries=None: fake)
+        "goldboard_data.price_sources.fetch_best_price",
+        lambda: {"value": 3539.0,
+                 "as_of": datetime(2026, 11, 21, 20, 10, 38,
+                                   tzinfo=timezone.utc),
+                 "source": "gold-api.com", "kind": "spot",
+                 "tried": [{"source": "gold-api.com", "ok": True,
+                            "error": None}],
+                 "diverged": False, "quotes": []})
     ticks: list[dict] = []
     worker = LivePriceWorker(interval_seconds=5)
     worker.price_updated.connect(ticks.append)
@@ -274,7 +277,43 @@ def test_live_price_worker_emits_ticks(tmp_path, monkeypatch, qapp):
     worker.stop()
     worker.wait(3000)
     assert len(ticks) >= 1
-    assert ticks[0]["value"] == pytest.approx(3515.4)
+    assert ticks[0]["value"] == pytest.approx(3539.0)
+    assert ticks[0]["source"] == "gold-api.com"
+    assert ticks[0]["kind"] == "spot"
+
+
+def test_technical_panel_renders_summary_and_setups(
+        tmp_path, monkeypatch, qapp):
+    """v0.3.0: technical summary panel + setups list render from
+    stored bars (no network)."""
+    from datetime import timedelta
+
+    from goldboard_core.storage import save_price_bars
+
+    db = tmp_path / "goldboard.db"
+    _seed_db(db)
+    price = 3000.0
+    bars = []
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    for i in range(250):
+        price += 3.0
+        bars.append({"ts": base + timedelta(days=i),
+                     "open": price - 0.5, "high": price + 1.0,
+                     "low": price - 1.0, "close": price, "volume": None,
+                     "interval": "1d"})
+    save_price_bars(db, bars)
+    payload = collect_dashboard_data(db, refresh=False)
+    assert payload["technical"]["complete"] is True
+    assert payload["technical"]["signal"] in ("buy", "strong buy")
+    assert len(payload["setups"]) >= 1
+    window = MainWindow(db_path=db, enable_live_ticker=False)
+    window.show()
+    qapp.processEvents()
+    window._on_refresh_finished(payload)
+    assert "Aggregate:" in window._technical_label.text()
+    assert "RSI(14)" in window._technical_label.text()
+    assert window._setups_list.count() >= 1
+    window.close()
 
 
 def test_no_refresh_starts_after_window_close(tmp_path, monkeypatch, qapp):

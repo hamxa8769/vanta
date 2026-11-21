@@ -24,6 +24,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from goldboard_core.indicators import atr as _atr_series
+
 SMA_PERIOD = 20
 ATR_PERIOD = 14
 SL_ATR_MULTIPLE = 1.5
@@ -48,28 +50,6 @@ def _parse_dt(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _atr_series(bars: list[dict]) -> list[float | None]:
-    """Wilder's ATR(14) — None until 14 true ranges are available."""
-    trs: list[float] = []
-    for i, bar in enumerate(bars):
-        high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
-        if i == 0:
-            trs.append(high - low)
-        else:
-            prev_close = float(bars[i - 1]["close"])
-            trs.append(max(high - low, abs(high - prev_close),
-                           abs(low - prev_close)))
-    out: list[float | None] = []
-    for i in range(len(bars)):
-        if i < ATR_PERIOD - 1:
-            out.append(None)
-        elif i == ATR_PERIOD - 1:
-            out.append(sum(trs[:ATR_PERIOD]) / ATR_PERIOD)
-        else:
-            out.append((out[-1] * (ATR_PERIOD - 1) + trs[i]) / ATR_PERIOD)
-    return out
 
 
 def generate_replay_signals(bars: list[dict]) -> list[dict]:

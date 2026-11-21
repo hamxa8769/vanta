@@ -919,6 +919,24 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         grid.addWidget(box, 4, 0, 1, 3)
 
+        # (12) Technical summary + setups — computed locally from
+        # stored Yahoo history (free; Finnhub's aggregate endpoint
+        # is premium-only). Advisory only, never a trade order.
+        box, layout = self._panel("Technical summary & setups (advisory)")
+        self._technical_label = QLabel(
+            "No history yet — refresh to compute RSI / MACD / SMA / ADX.",
+            content)
+        self._technical_label.setWordWrap(True)
+        self._technical_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._setups_list = QListWidget(content)
+        self._setups_list.setWordWrap(True)
+        self._setups_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._setups_list.setMinimumHeight(120)
+        layout.addWidget(self._technical_label)
+        layout.addWidget(self._setups_list)
+        layout.addStretch(1)
+        grid.addWidget(box, 5, 0, 1, 3)
+
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
@@ -1016,9 +1034,11 @@ class MainWindow(QMainWindow):
         self._live_tick = tick
         self._price_value.setText(_fmt_value(value, "USD/oz"))
         stamp = _fmt_time(tick.get("fetched_at"))
+        source = tick.get("source") or "Yahoo Finance (GC=F)"
+        kind = tick.get("kind") or "futures"
         self._price_source.setText(
-            f"Source: Yahoo Finance delayed quote (GC=F) as proxy for live "
-            f"XAUUSD spot · tick {stamp}")
+            f"Source: {source} · {kind} · tick {stamp}"
+            + (" · ⚠ sources disagree >1.5%" if tick.get("diverged") else ""))
         if prev is not None and prev > 0:
             change = value - prev
             pct = change / prev * 100.0
@@ -1333,6 +1353,50 @@ class MainWindow(QMainWindow):
             f"History stored: {daily} daily bars (2y) · {intraday} intraday "
             f"bars (5d, 15m). Press “Run backtest” to evaluate the board's "
             f"signals and the price-only replay on the daily bars.")
+
+        # (12) Technical summary & setups — local, free, advisory.
+        tech = payload.get("technical") or {}
+        if tech and tech.get("bars_daily"):
+            lines = [
+                f"Aggregate: {str(tech.get('signal', 'neutral')).upper()} — "
+                f"{tech.get('buy', 0)} buy / {tech.get('neutral', 0)} neutral "
+                f"/ {tech.get('sell', 0)} sell signals "
+                f"({tech.get('bars_daily')} daily bars)",
+                f"Regime: {tech.get('regime', '—')}",
+            ]
+            if tech.get("rsi14") is not None:
+                lines.append(f"RSI(14): {tech['rsi14']:.1f}")
+            if tech.get("macd") is not None and tech.get("macd_signal") is not None:
+                lines.append(
+                    f"MACD: {tech['macd']:.2f} vs signal "
+                    f"{tech['macd_signal']:.2f} "
+                    f"(hist {tech.get('macd_hist') or 0:.2f})")
+            if tech.get("sma20") is not None:
+                lines.append(
+                    f"SMA20 {tech['sma20']:,.2f} · SMA50 "
+                    f"{(tech.get('sma50') or 0):,.2f} · SMA200 "
+                    f"{(tech.get('sma200') or 0):,.2f}")
+            if tech.get("atr14") is not None:
+                lines.append(f"ATR(14): {tech['atr14']:,.2f} USD/oz")
+            lines.append(
+                "Computed locally from stored Yahoo history — the "
+                "Finnhub aggregate endpoint is premium-only, this is "
+                "the free equivalent. Advisory only, NOT a trade order.")
+            self._technical_label.setText("\n".join(lines))
+        else:
+            self._technical_label.setText(
+                "No history yet — refresh to compute RSI / MACD / SMA / ADX.")
+        self._setups_list.clear()
+        for setup in payload.get("setups", []):
+            header = (f"{setup.get('name', '')} — "
+                      f"{str(setup.get('direction', 'none')).upper()} · "
+                      f"{setup.get('confidence', '')} confidence")
+            self._setups_list.addItem(QListWidgetItem(header))
+            for reason in setup.get("reasons", []):
+                self._setups_list.addItem(QListWidgetItem(f"   • {reason}"))
+        if not payload.get("setups"):
+            self._setups_list.addItem(QListWidgetItem(
+                "No setups yet — refresh to evaluate the rules."))
 
     # ------------------------------------------------------------------ alerts
 
