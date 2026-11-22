@@ -1,10 +1,10 @@
-"""Frozen e2e check for v0.4.0 (NOT a pytest test).
+"""Frozen e2e check for v0.5.0 (NOT a pytest test).
 
 Launches the frozen dist/Vanta/Vanta binary headless (offscreen)
 with an isolated HOME for ~180s, then inspects the DB it wrote:
 price bars (daily + intraday), snapshots per source, and recomputes
 the technical summary + setups + volume profile from the stored
-real bars to prove the new v0.4.0 panels have real data behind them.
+real bars to prove the new v0.5.0 panels have real data behind them.
 
 Usage: python scripts/e2e_frozen.py [seconds]
 """
@@ -107,8 +107,19 @@ def main() -> int:
                   else None),
         "adx": (round(tech["adx"], 1) if tech["adx"] is not None else None),
     })
+    rf = tech.get("regime_filter") or {}
+    print("regime filter:", {
+        "label": rf.get("label"),
+        "er": (round(rf["er"], 2) if rf.get("er") is not None else None),
+        "chop": (round(rf["chop"], 1) if rf.get("chop") is not None else None),
+        "atr_percentile": (
+            round(rf["atr_percentile"], 1)
+            if rf.get("atr_percentile") is not None else None),
+        "reasons": rf.get("reasons", []),
+    })
     nxt = next_event()
-    setups = generate_setups(tech, None, None, None, None, daily, nxt)
+    setups = generate_setups(tech, None, None, None, None, daily, nxt,
+                             tech.get("regime_filter"))
     print(f"setups ({len(setups)}):")
     for s in setups:
         print(f"  - {s['name']} [{s['direction']}/{s['confidence']}]")

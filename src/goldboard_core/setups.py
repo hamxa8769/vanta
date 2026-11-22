@@ -14,6 +14,9 @@ Rules (all need a complete technical summary unless noted):
   * Trend continuation — technical signal + ADX>25 + score agrees.
   * Oversold / overbought bounce — RSI<30 / >70 + score not opposed.
   * Range fade (Muuk-style) — ADX<20 (ranging) + price near SMA20.
+    Suppressed when the regime filter says TRENDING: fading a range
+    in a trending market is the trap the regime filter exists to
+    stop (the spec's "martingale trap-in-range").
   * Breakout watch — close within 0.5% of the 20-day high/low.
   * Event caution — FOMC within 2 days: stand down / size down.
   * Conflict — technical and score strongly disagree: no setup.
@@ -32,7 +35,8 @@ def generate_setups(technical: dict, score_total: float | None,
                     cot_pctile: float | None, etf_gld_change: float | None,
                     fomc_days_away: int | None,
                     daily_bars: list[dict] | None = None,
-                    next_event: dict | None = None) -> list[dict]:
+                    next_event: dict | None = None,
+                    regime_filter: dict | None = None) -> list[dict]:
     """Evaluate the setup rules. Pure function — no I/O, no trading."""
     setups: list[dict] = []
     if not technical.get("complete"):
@@ -123,17 +127,25 @@ def generate_setups(technical: dict, score_total: float | None,
                 "bounce"))
 
     # Range fade (Muuk-style): ranging market + price hugging SMA20.
+    # Suppressed when the regime filter says TRENDING — fading a range
+    # while three methods agree the market is trending is exactly the
+    # trap the filter exists to stop. When the filter says CHOPPY,
+    # the fade gets a supporting reason instead.
+    regime_label = (regime_filter or {}).get("label")
     if adx_v is not None and adx_v < 20 and sma20_v and last_close:
         dist_pct = abs(last_close - sma20_v) / sma20_v * 100.0
-        if dist_pct < 1.0:
+        if dist_pct < 1.0 and regime_label != "trending":
+            reasons = [f"ADX {adx_v:.0f} — market is ranging, not trending.",
+                       f"Price {dist_pct:.2f}% from SMA20 — fade the edge of "
+                       "the range back toward the middle, the way Muuk's "
+                       "pending-order ranges do."]
+            if regime_label == "choppy":
+                reasons.append("Regime filter agrees: CHOPPY "
+                               "(ER < 0.3, CHOP > 61.8).")
             setups.append(_setup(
                 "Range fade (Muuk-style)",
                 "long" if last_close < sma20_v else "short", "medium",
-                [f"ADX {adx_v:.0f} — market is ranging, not trending.",
-                 f"Price {dist_pct:.2f}% from SMA20 — fade the edge of "
-                 "the range back toward the middle, the way Muuk's "
-                 "pending-order ranges do."],
-                "range"))
+                reasons, "range"))
 
     # Breakout watch: close within 0.5% of the 20-day high/low.
     if daily_bars and len(daily_bars) >= 20 and last_close:

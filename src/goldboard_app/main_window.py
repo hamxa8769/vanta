@@ -1585,6 +1585,23 @@ class MainWindow(QMainWindow):
                     f"{(tech.get('sma200') or 0):,.2f}")
             if tech.get("atr14") is not None:
                 lines.append(f"ATR(14): {tech['atr14']:,.2f} USD/oz")
+            # Regime filter (v0.5.0): ER + CHOP + ADX, three methods.
+            rf = tech.get("regime_filter") or {}
+            if rf.get("label") and rf["label"] != "unknown":
+                er_t = f"{rf['er']:.2f}" if rf.get("er") is not None else "—"
+                chop_t = (f"{rf['chop']:.1f}"
+                          if rf.get("chop") is not None else "—")
+                pct_t = (f"{rf['atr_percentile']:.0f}%"
+                         if rf.get("atr_percentile") is not None else "—")
+                lines.append(
+                    f"Regime filter: {str(rf['label']).upper()} — "
+                    f"ER {er_t} · CHOP {chop_t} · ATR percentile {pct_t}")
+                for reason in rf.get("reasons", []):
+                    lines.append(f"   • {reason}")
+                lines.append(
+                    "Spread rule: not measurable from Yahoo bars (no "
+                    "spread in them); news window is covered by the event "
+                    "caution setup above.")
             lines.append(
                 "Computed locally from stored Yahoo history — the "
                 "Finnhub aggregate endpoint is premium-only, this is "

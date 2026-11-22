@@ -96,6 +96,77 @@ def macd(closes: list[float], fast: int = 12, slow: int = 26,
     return line, sig, hist
 
 
+def efficiency_ratio(closes: list[float], period: int = 20) -> list[float | None]:
+    """Kaufman's Efficiency Ratio: how straight price moved.
+
+    ER = |Close - Close[n]| / sum(|daily changes|). Near 1 = price
+    marched straight (trending); near 0 = it wandered and ended
+    where it started (choppy). None until ``period`` closes exist.
+    """
+    out: list[float | None] = [None] * len(closes)
+    for i in range(period, len(closes)):
+        change = abs(float(closes[i]) - float(closes[i - period]))
+        path = sum(abs(float(closes[j]) - float(closes[j - 1]))
+                   for j in range(i - period + 1, i + 1))
+        out[i] = (change / path) if path > 0 else 0.0
+    return out
+
+
+def choppiness(bars: list[dict], period: int = 14) -> list[float | None]:
+    """Choppiness Index (0-100): how scattered the range is.
+
+    CHOP = 100 * log10(sum(TR, n) / (highest high - lowest low))
+    / log10(n). Above 61.8 = choppy, below 38.2 = trending.
+    None until ``period`` bars exist.
+    """
+    import math
+
+    out: list[float | None] = [None] * len(bars)
+    if period <= 1:
+        return out
+    log_n = math.log10(period)
+    for i in range(period - 1, len(bars)):
+        window = bars[i - period + 1:i + 1]
+        tr_sum = 0.0
+        for j, bar in enumerate(window):
+            high, low = float(bar["high"]), float(bar["low"])
+            if j == 0:
+                tr_sum += high - low
+            else:
+                prev_close = float(window[j - 1]["close"])
+                tr_sum += max(high - low, abs(high - prev_close),
+                              abs(low - prev_close))
+        highest = max(float(b["high"]) for b in window)
+        lowest = min(float(b["low"]) for b in window)
+        span = highest - lowest
+        if span <= 0 or tr_sum <= 0:
+            out[i] = 50.0
+        else:
+            out[i] = 100.0 * math.log10(tr_sum / span) / log_n
+    return out
+
+
+def atr_percentile(atr_values: list[float | None],
+                   lookback: int = 250) -> float | None:
+    """Where the latest ATR sits inside the last ``lookback`` ATRs.
+
+    0-100. Above 90 = volatility is extreme for this market (the
+    spec's HIGH-RISK trigger). None when fewer than 10 ATR values
+    exist. Only closed-bar ATRs are passed in — no lookahead.
+    """
+    known = [float(v) for v in atr_values if v is not None]
+    if len(known) < 10:
+        return None
+    window = known[-lookback:]
+    latest = window[-1]
+    # Values within a hair of the latest count as equal: Wilder ATR
+    # creeps asymptotically toward a constant TR, so without this the
+    # latest ATR is always "the highest" on a flat-volatility series.
+    eps = abs(latest) * 1e-9
+    below = sum(1 for v in window[:-1] if v < latest - eps)
+    return 100.0 * below / max(1, len(window) - 1)
+
+
 def atr(bars: list[dict], period: int = 14) -> list[float | None]:
     """Wilder's ATR — None until ``period`` true ranges are available.
 

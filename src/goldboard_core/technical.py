@@ -15,7 +15,8 @@ are doing. Both are shown; neither overrides the other.
 
 from __future__ import annotations
 
-from .indicators import adx, atr, bollinger, macd, rsi, sma
+from .indicators import (adx, atr, atr_percentile, bollinger,
+                         choppiness, efficiency_ratio, macd, rsi, sma)
 
 MIN_DAILY_BARS = 50  # enough to seed SMA200? No — 50 seeds RSI/MACD/ADX
 
@@ -152,5 +153,46 @@ def technical_summary(daily_bars: list[dict],
             out["regime"] = f"ranging (ADX {adx_v:.0f})"
         else:
             out["regime"] = f"transition (ADX {adx_v:.0f})"
+    # Regime filter (v0.5.0) — the spec's 4-state classification from
+    # three independent methods, so no single indicator decides:
+    #   TRENDING: ER > 0.5 AND CHOP < 38.2 AND ADX > 25
+    #   CHOPPY:   ER < 0.3 AND CHOP > 61.8
+    #   HIGH-RISK: ATR percentile > 90 (volatility extreme for gold)
+    #   UNCLEAR:  everything else
+    # The spec's spread rule (spread > 2x median) is NOT measurable
+    # from Yahoo bars — there is no spread in them — so the panel says
+    # so instead of inventing one. The spec's news window is covered
+    # by the setups engine's event caution (any macro event ≤ 2 days).
+    er_v = _last(efficiency_ratio(closes, 20))
+    chop_v = _last(choppiness(daily_bars, 14))
+    atr_pct_v = atr_percentile(atr_s, 250)
+    regime_filter: dict = {"label": "unknown", "er": er_v,
+                          "chop": chop_v, "atr_percentile": atr_pct_v,
+                          "reasons": []}
+    if er_v is not None and chop_v is not None and adx_v is not None:
+        if atr_pct_v is not None and atr_pct_v > 90:
+            regime_filter["label"] = "high-risk"
+            regime_filter["reasons"].append(
+                f"ATR percentile {atr_pct_v:.0f} — volatility is extreme "
+                "for gold (above 90).")
+        elif er_v > 0.5 and chop_v < 38.2 and adx_v > 25:
+            regime_filter["label"] = "trending"
+            regime_filter["reasons"].append(
+                f"ER {er_v:.2f} > 0.5, CHOP {chop_v:.1f} < 38.2, "
+                f"ADX {adx_v:.0f} > 25 — three methods agree: trending.")
+        elif er_v < 0.3 and chop_v > 61.8:
+            regime_filter["label"] = "choppy"
+            regime_filter["reasons"].append(
+                f"ER {er_v:.2f} < 0.3, CHOP {chop_v:.1f} > 61.8 — "
+                "price is wandering, not marching.")
+        else:
+            regime_filter["label"] = "unclear"
+            regime_filter["reasons"].append(
+                f"ER {er_v:.2f}, CHOP {chop_v:.1f}, ADX {adx_v:.0f} — "
+                "the methods do not agree; no new read.")
+    else:
+        regime_filter["reasons"].append(
+            "Not enough history yet for ER / CHOP / ADX.")
+    out["regime_filter"] = regime_filter
     out["complete"] = len(closes) >= MIN_DAILY_BARS
     return out

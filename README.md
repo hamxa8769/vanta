@@ -150,8 +150,25 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.4.0**. Every release bumps the
+carry the same version. Current: **0.5.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.5.0 is the Regime Filter — the market's own answer to "trending
+or choppy?", built from the spec's three independent methods so no
+single indicator decides. The Technical Summary panel now shows
+Kaufman's Efficiency Ratio ER(20), the Choppiness Index CHOP(14),
+and the ATR(14) percentile over the last 250 daily bars, plus a
+4-state regime label: TRENDING (ER > 0.5, CHOP < 38.2, ADX > 25),
+CHOPPY (ER < 0.3, CHOP > 61.8), HIGH-RISK (ATR percentile > 90),
+UNCLEAR (the methods disagree). The setups engine listens to it:
+the Muuk-style range fade is suppressed while the filter says
+TRENDING — fading a range in a trending market is the trap the
+filter exists to stop — and gets a supporting reason when it says
+CHOPPY. Two honest limits, stated in the panel: the spec's spread
+rule (spread > 2x median) cannot be measured from Yahoo bars
+because they carry no spread, and the news window is covered by the
+existing event-caution setup (any macro event within 2 days).
+Thresholds are the spec's starting points, NOT optimized.
 
 v0.4.0 is the Live Research Engine + the modern dashboard. The chart
 is now the real TradingView candlestick chart (Advanced Real-Time

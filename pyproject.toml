@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vanta"
-version = "0.4.0"
+version = "0.5.0"
 description = "Vanta — Gold Institutional Analysis Board: standalone shadow/advisory XAUUSD analysis core (SQLite, no live trading)"
 readme = "README.md"
 requires-python = ">=3.12"

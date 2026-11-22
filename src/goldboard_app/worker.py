@@ -355,7 +355,7 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
             float(cot_snap.value) if cot_snap is not None else None,
             float(etf_snap.value) if etf_snap is not None else None,
             fomc_days, payload["price_bars_daily"],
-            next_event())
+            next_event(), payload["technical"].get("regime_filter"))
     except Exception as exc:
         payload["setups"] = []
         payload["errors"].append(f"setups failed: {exc!r}")
