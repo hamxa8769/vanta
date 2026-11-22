@@ -25,6 +25,7 @@ from pathlib import Path
 
 from goldboard_core.api import get_features, get_score, get_signal
 from goldboard_core.backtest import backtest, split_backtest
+from goldboard_core.derived import compute_derived_series
 from goldboard_core.gates import evaluate_gates, ready_for_muuk
 from goldboard_core.replay import REPLAY_RULE_TEXT, generate_replay_signals
 from goldboard_core.setups import generate_setups
@@ -252,6 +253,14 @@ def collect_dashboard_data(db_path: str | Path, refresh: bool = True) -> dict:
         # real data, never a live-fetch promise).
         _fetch_history(db_path, payload["errors"])
         _fetch_news(db_path, payload["errors"])
+        # Derived series: scored quantities computed from STORED history
+        # (52w COT percentile, 13w ETF flow, 30d macro/comex changes).
+        # Runs after the refresh so the fresh snapshots are included;
+        # a failure here is recorded, never fatal to the refresh.
+        try:
+            compute_derived_series(db_path)
+        except Exception as exc:  # derived must never kill the refresh
+            payload["errors"].append(f"derived series failed: {exc!r}")
 
     try:
         payload["features"] = get_features(db_path)

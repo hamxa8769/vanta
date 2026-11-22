@@ -85,9 +85,12 @@ def test_collect_dashboard_data_with_mocked_registry(tmp_path, monkeypatch):
     payload = collect_dashboard_data(db, refresh=True)
     assert payload["errors"] == []
     assert payload["report"]["price"]["status"] == "ok"
-    # 0.25*60 + 0.20*40 + 0.25*(-20) + 0.15*10 + 0.15*0 = 19.5
+    # 0.25*70 + 0.20*40 + 0.25*(-20) + 0.15*10 + 0.15*0 = 22.0 — the
+    # COT pillar is 70, not 60: the seed's raw cot_gold_mm_net_pct_oi
+    # (35.0) maps through the v0.6.0 alias (clamp(35*2)) and outranks
+    # the synthetic cot_score=60.
     assert payload["score"] is not None
-    assert payload["score"].total == pytest.approx(19.5)
+    assert payload["score"].total == pytest.approx(22.0)
     assert len(payload["score"].components) == 5
     assert payload["price"] is not None
     assert payload["price"].value == pytest.approx(4000.0)
@@ -120,7 +123,7 @@ def test_refresh_worker_emits_results_on_mocked_registry(
     assert errors == []
     assert len(received) == 1
     assert received[0]["score"] is not None
-    assert received[0]["score"].total == pytest.approx(19.5)
+    assert received[0]["score"].total == pytest.approx(22.0)
 
 
 def test_refresh_worker_runs_on_qthread(tmp_path, monkeypatch, qapp):
@@ -159,7 +162,7 @@ def test_main_window_constructs_and_shows_vanta(tmp_path, monkeypatch, qapp):
     assert "NOT ready for Muuk integration" in window._gates_banner.text()
     # Seeded values are visible, with provenance.
     assert "4,000" in window._price_value.text()
-    assert window._score_value.text().startswith("Total: +19.5")
+    assert window._score_value.text().startswith("Total: +22.0")
     assert window._components_list.count() >= 5
     assert window._freshness_list.count() == len(
         __import__("goldboard_app.worker", fromlist=["FRESHNESS_SOURCES"]).FRESHNESS_SOURCES)

@@ -30,6 +30,7 @@ COMPONENT_SERIES: dict[str, list[str]] = {
     "cot": [
         "cot_managed_money_net_pctile_52w",
         "cot_managed_money_net_pct_oi",
+        "cot_gold_mm_net_pct_oi",
         "cot_score",
     ],
     "central_bank_etf": [

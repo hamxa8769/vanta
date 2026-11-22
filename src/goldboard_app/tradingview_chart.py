@@ -21,7 +21,7 @@ PriceChart) and lives on the second page of a QStackedWidget.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QLabel, QStackedWidget, QWidget
 
 try:
@@ -47,25 +47,39 @@ WIDGET_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 # How long to wait for the widget's iframe before falling back.
 WATCHDOG_SECONDS = 20
 
+# Both pages must be this tall: the fallback chart used to have no
+# minimum height at all, so when TradingView failed to load the
+# whole panel collapsed and the chart looked invisible. The stacked
+# widget itself gets the same minimum so the panel never shrinks.
+CHART_MIN_HEIGHT = 480
+
 
 class TradingViewChart(QStackedWidget):
     """TradingView chart with a built-in fallback.
 
     ``fallback`` is the widget shown when TradingView cannot load
     (the existing PriceChart). Page 0 = web view, page 1 = fallback.
+
+    ``status_changed`` fires True when the TradingView iframe is
+    live and False when the widget falls back, so the window can
+    show an honest status line + a Retry button.
     """
+
+    status_changed = Signal(bool)
 
     def __init__(self, fallback: QWidget, parent: QWidget | None = None,
                  html: str = WIDGET_HTML) -> None:
         super().__init__(parent)
+        self.setMinimumHeight(CHART_MIN_HEIGHT)
         self._fallback = fallback
+        self._fallback.setMinimumHeight(CHART_MIN_HEIGHT)
         self._live = False
         self._elapsed = 0
         self._html = html
         self._view = None
         if WEBENGINE_AVAILABLE:
             self._view = QWebEngineView(self)
-            self._view.setMinimumHeight(380)
+            self._view.setMinimumHeight(CHART_MIN_HEIGHT)
             self.addWidget(self._view)
             self.addWidget(self._fallback)
             self.setCurrentIndex(0)
@@ -87,12 +101,33 @@ class TradingViewChart(QStackedWidget):
         """True once the TradingView iframe has appeared."""
         return self._live
 
+    def reload(self) -> None:
+        """Retry TradingView: reset the watchdog and load it again.
+
+        With no WebEngine there is nothing to reload — the fallback
+        stays. The window shows "reloading…" until the watchdog
+        either finds the iframe (live) or falls back again.
+        """
+        self._live = False
+        self._elapsed = 0
+        if self._view is None:
+            self.show_fallback()
+            return
+        self.setCurrentIndex(0)
+        self._view.setHtml(self._html,
+                           baseUrl="https://www.tradingview.com/")
+        if hasattr(self, "_watchdog"):
+            self._watchdog.start()
+
     def show_fallback(self) -> None:
         """Switch to the built-in chart (and stop the watchdog)."""
+        was_on_tv = self.currentIndex() == 0
         if hasattr(self, "_watchdog"):
             self._watchdog.stop()
         self._live = False
         self.setCurrentIndex(1)
+        if was_on_tv:
+            self.status_changed.emit(False)
 
     def _on_load_finished(self, ok: bool) -> None:
         if not ok:
@@ -113,7 +148,9 @@ class TradingViewChart(QStackedWidget):
         except (TypeError, ValueError):
             found = False
         if found:
-            self._live = True
+            if not self._live:
+                self._live = True
+                self.status_changed.emit(True)
             if hasattr(self, "_watchdog"):
                 self._watchdog.stop()
         elif self._elapsed >= WATCHDOG_SECONDS:

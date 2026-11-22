@@ -39,7 +39,7 @@ PALETTE = {
     "gold_light": "#E3C565",
     "surface": "#161617",
     "text": "#F2EDE3",
-    "muted": "#9A958A",
+    "muted": "#A8A39A",  # bumped from #9A958A (v0.6.0): a touch lighter
 }
 
 

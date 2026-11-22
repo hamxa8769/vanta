@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDockWidget,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QGridLayout,
     QHBoxLayout,
@@ -135,6 +136,53 @@ def _snapshot_line(snap, label: str = "") -> str:
         f"{prefix}{_fmt_value(snap.value, snap.unit)}"
         f" · {snap.source}{status}{proxy} · {stamp}"
     )
+
+
+# Small rounded status chips (v0.6.0): regime + technical signal get
+# a coloured pill instead of a plain word, in the summary strip and
+# in the Technical Summary panel. One helper, reused in both places.
+PILL_COLORS = {
+    "green": ("#2E9E5B", "#FFFFFF"),
+    "amber": ("#C77E2A", "#FFFFFF"),
+    "red": ("#C0392B", "#FFFFFF"),
+    "grey": ("#3A3A3C", "#F2EDE3"),
+    "gold": ("#C9A227", "#0B0B0C"),
+}
+
+REGIME_PILL_KIND = {"trending": "green", "choppy": "amber",
+                    "high-risk": "red", "unclear": "grey"}
+SIGNAL_PILL_KIND = {"buy": "green", "strong buy": "green",
+                    "sell": "red", "strong sell": "red",
+                    "neutral": "grey"}
+
+
+def _status_pill(text: str, kind: str = "grey") -> QLabel:
+    """A small rounded chip label; restyle with _set_pill()."""
+    label = QLabel(text)
+    label.setAlignment(Qt.AlignCenter)
+    _set_pill(label, text, kind)
+    return label
+
+
+def _set_pill(label: QLabel, text: str, kind: str = "grey") -> None:
+    bg, fg = PILL_COLORS.get(kind, PILL_COLORS["grey"])
+    label.setText(text)
+    label.setStyleSheet(
+        f"background-color: {bg}; color: {fg}; border-radius: 10px; "
+        "padding: 3px 12px; font-weight: bold; font-size: 12px;")
+
+
+def _score_verdict(total: float) -> str:
+    """Display-only word for the institutional total (no logic change)."""
+    if total >= 40:
+        return "Strongly bullish"
+    if total >= 15:
+        return "Bullish"
+    if total <= -40:
+        return "Strongly bearish"
+    if total <= -15:
+        return "Bearish"
+    return "Neutral"
 
 
 # ------------------------------------------------------------------ widgets
@@ -746,7 +794,7 @@ class MainWindow(QMainWindow):
         QLabel {{ color: {PALETTE["text"]}; background: transparent; }}
         QLabel.muted {{ color: {PALETTE["muted"]}; }}
         QPushButton {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
-            border: none; border-radius: 4px; padding: 6px 14px; font-weight: bold; }}
+            border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
         QPushButton:hover {{ background: {PALETTE["gold_light"]}; }}
         QPushButton:disabled {{ background: #3A3A3C; color: {PALETTE["muted"]}; }}
         QPushButton.ghost {{ background: transparent; color: {PALETTE["gold"]};
@@ -755,12 +803,12 @@ class MainWindow(QMainWindow):
         QPushButton.gold {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
             border: none; }}
         QMenu {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
-            border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 4px; }}
+            border: 1px solid {PALETTE["gold"]}; border-radius: 6px; padding: 4px; }}
         QMenu::item:selected {{ background: #2a2415; }}
-        QGroupBox {{ border: 1px solid #3d3420; border-radius: 8px;
-            margin-top: 12px; padding: 12px; background: {PALETTE["surface"]}; }}
+        QGroupBox {{ border: 1px solid #2e2a1e; border-radius: 12px;
+            margin-top: 14px; padding: 16px; background: {PALETTE["surface"]}; }}
         QGroupBox::title {{ color: {PALETTE["gold"]}; subcontrol-origin: margin;
-            left: 8px; padding: 0 4px; font-weight: bold; }}
+            left: 8px; padding: 0 4px; font-weight: bold; font-size: 14px; }}
         QSpinBox {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 3px; }}
         QLineEdit {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
@@ -914,20 +962,221 @@ class MainWindow(QMainWindow):
         self._relayout_panels()
         self._build_panels_menu()
 
+    # ------------------------------------------------------- summary strip
+    # v0.6.0: the essence of the whole analysis, always at the top,
+    # above all panels and NOT hideable from the Panels menu. One row
+    # of KPI cards, each fed from the payload the worker already
+    # produces — no new data sources. Before the first refresh every
+    # card shows an honest empty state ("—" / "No data yet").
+
+    def _kpi_card(self, title: str, pill: bool = False,
+                  value_size: int = 20, wrap_value: bool = False
+                  ) -> tuple[QFrame, QLabel, QLabel]:
+        """One strip card: small title, big value, small sub-line.
+
+        Values do not wrap by default: a word-wrapped QLabel reports
+        a huge sizeHint before it is laid out (it wraps the 28px
+        price into 4 lines at width 0) and the whole strip balloons
+        to ~270px tall. Only the event card wraps (long event names).
+        """
+        frame = QFrame(self)
+        # Scoped to this frame by object name: a bare declaration
+        # block on a QFrame would cascade to every child label and
+        # wrap each of them in its own bordered box (and inflate the
+        # strip to ~270px tall).
+        frame.setObjectName("kpiCard")
+        frame.setStyleSheet(
+            f"#kpiCard {{ background: {PALETTE['surface']}; "
+            "border: 1px solid #2e2a1e; border-radius: 12px; "
+            "padding: 10px; }")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+        title_label = QLabel(title, frame)
+        title_label.setFont(_font(10, bold=True))
+        title_label.setProperty("class", "muted")
+        layout.addWidget(title_label)
+        if pill:
+            value = _status_pill("—", "grey")
+            row = QHBoxLayout()
+            row.addWidget(value)
+            row.addStretch(1)
+            layout.addLayout(row)
+        else:
+            value = QLabel("—", frame)
+            value.setFont(_font(value_size, bold=True))
+            value.setStyleSheet(f"color: {PALETTE['gold_light']};")
+            value.setWordWrap(wrap_value)
+            layout.addWidget(value)
+        sub = QLabel("No data yet", frame)
+        sub.setFont(_font(11))
+        sub.setProperty("class", "muted")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+        layout.addStretch(1)
+        return frame, value, sub
+
+    def _build_summary_strip(self) -> QWidget:
+        strip = QWidget(self)
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        self._strip_cards: dict[str, dict] = {}
+        specs = [
+            ("price", "LIVE PRICE · XAUUSD", False, 28, False),
+            ("technical", "TECHNICAL SIGNAL", True, 20, False),
+            ("regime", "REGIME FILTER", True, 20, False),
+            ("score", "INSTITUTIONAL SCORE", False, 20, False),
+            ("setups", "ACTIVE SETUPS", False, 20, False),
+            ("event", "NEXT MACRO EVENT", False, 15, True),
+            ("volume", "VOLUME PROFILE · POC", False, 20, False),
+        ]
+        for key, title, pill, size, wrap in specs:
+            frame, value, sub = self._kpi_card(title, pill=pill,
+                                               value_size=size,
+                                               wrap_value=wrap)
+            self._strip_cards[key] = {"frame": frame, "value": value,
+                                      "sub": sub}
+            row.addWidget(frame, 1)
+        # Guard: the strip is a summary, it must never eat the board.
+        strip.setMaximumHeight(150)
+        self._strip_widget = strip
+        return strip
+
+    def _update_summary_strip(self, payload: dict) -> None:
+        """Refresh every strip card from the payload (called on every
+        refresh; the live ticker updates the price card separately)."""
+        cards = self._strip_cards
+
+        # (1) Live price + change vs yesterday + source. The value
+        # shows no unit: the card title already says XAUUSD, and the
+        # unit would push the 28px value onto a second line.
+        price = payload.get("price")
+        if price is not None:
+            cards["price"]["value"].setText(_fmt_value(price.value))
+            history = payload.get("price_history", []) or []
+            if len(history) >= 2:
+                prev = history[-2]["value"]
+                change = price.value - prev
+                pct = (change / prev * 100.0) if prev else 0.0
+                sign = "+" if change >= 0 else ""
+                change_t = f"{sign}{change:,.2f} ({sign}{pct:.2f}%) vs prev"
+            else:
+                change_t = "Change: —"
+            source = getattr(price, "source", "") or "Yahoo Finance (GC=F)"
+            if getattr(price, "is_proxy", False):
+                source += " (proxy)"
+            live = " · ● LIVE" if self._ticker_ok else ""
+            cards["price"]["sub"].setText(f"{change_t} · {source}{live}")
+        else:
+            cards["price"]["value"].setText("—")
+            cards["price"]["sub"].setText(
+                "No data yet — refresh to fetch the quote.")
+
+        # (2) Technical signal + buy/sell counts.
+        tech = payload.get("technical") or {}
+        if tech.get("bars_daily"):
+            signal = str(tech.get("signal", "neutral"))
+            _set_pill(cards["technical"]["value"], signal.upper(),
+                      SIGNAL_PILL_KIND.get(signal.lower(), "grey"))
+            cards["technical"]["sub"].setText(
+                f"{tech.get('buy', 0)} buy / {tech.get('neutral', 0)} "
+                f"neutral / {tech.get('sell', 0)} sell")
+        else:
+            _set_pill(cards["technical"]["value"], "—", "grey")
+            cards["technical"]["sub"].setText(
+                "No data yet — refresh to compute indicators.")
+
+        # (3) Regime filter label + ER / CHOP.
+        rf = tech.get("regime_filter") or {}
+        label = str(rf.get("label") or "")
+        if label and label != "unknown":
+            _set_pill(cards["regime"]["value"], label.upper(),
+                      REGIME_PILL_KIND.get(label, "grey"))
+            er_t = (f"{rf['er']:.2f}"
+                    if rf.get("er") is not None else "—")
+            chop_t = (f"{rf['chop']:.1f}"
+                      if rf.get("chop") is not None else "—")
+            cards["regime"]["sub"].setText(f"ER {er_t} · CHOP {chop_t}")
+        else:
+            _set_pill(cards["regime"]["value"], "—", "grey")
+            cards["regime"]["sub"].setText(
+                "No data yet — needs 50+ daily bars.")
+
+        # (4) Institutional score + verdict + top component.
+        score = payload.get("score")
+        features = payload.get("features") or {}
+        pillars = sum(1 for v in features.values() if v is not None)
+        if score is not None:
+            cards["score"]["value"].setText(f"{score.total:+.1f} / ±100")
+            top = None
+            if score.components:
+                top = max(score.components, key=lambda c: abs(c.score))
+            top_t = f" · top: {top.name}" if top is not None else ""
+            cards["score"]["sub"].setText(
+                f"{_score_verdict(score.total)}{top_t} · "
+                f"{pillars} of 5 pillars")
+        else:
+            cards["score"]["value"].setText("—")
+            cards["score"]["sub"].setText("No score yet — no data.")
+
+        # (5) Active setups: count + top setup.
+        setups = payload.get("setups") or []
+        cards["setups"]["value"].setText(str(len(setups)))
+        if setups:
+            top = setups[0]
+            cards["setups"]["sub"].setText(
+                f"{top.get('name', '')} · "
+                f"{str(top.get('direction', 'none')).upper()}")
+        else:
+            cards["setups"]["sub"].setText(
+                "No setups yet — refresh to evaluate the rules.")
+
+        # (6) Next macro event + countdown.
+        events = payload.get("events") or []
+        if events:
+            nxt = events[0]
+            cards["event"]["value"].setText(nxt.get("name", "—"))
+            days = nxt.get("days_away")
+            when = (f"in {days} day{'s' if days != 1 else ''}"
+                    if days is not None else str(nxt.get("date", "")))
+            cards["event"]["sub"].setText(
+                f"{when} · {nxt.get('date', '')}")
+        else:
+            cards["event"]["value"].setText("—")
+            cards["event"]["sub"].setText("No events in the calendar yet.")
+
+        # (7) Volume profile POC + value area (no unit: the card
+        # title says what it is, and the unit would wrap the value).
+        profile = payload.get("volume_profile") or {}
+        if profile.get("complete"):
+            cards["volume"]["value"].setText(f"{profile['poc']:,.2f}")
+            cards["volume"]["sub"].setText(
+                f"Value area {profile['value_area_low']:,.0f} – "
+                f"{profile['value_area_high']:,.0f}")
+        else:
+            cards["volume"]["value"].setText("—")
+            cards["volume"]["sub"].setText(
+                "No data yet — refresh to fetch intraday bars.")
+
     def _build_panels(self) -> None:
         self._panels: list[dict] = []
         self._panel_visible: dict[str, bool] = {}
+        self._build_summary_strip()
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         content = QWidget(scroll)
         grid = QGridLayout(content)
+        grid.setSpacing(14)
+        grid.setVerticalSpacing(16)
         self._grid = grid
 
-        # (1) Gold price + TradingView chart.
+        # (1) Gold price + TradingView chart — full width, directly
+        # under the summary strip (v0.6.0: wide=True).
         box, layout = self._panel("Gold price (XAUUSD) — LIVE · TradingView")
         self._price_value = QLabel("—", content)
         self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._price_value.setFont(_font(22, bold=True))
+        self._price_value.setFont(_font(30, bold=True))
         self._price_value.setStyleSheet(f"color: {PALETTE['gold_light']};")
         self._price_change = QLabel("—", content)
         self._price_change.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -937,13 +1186,23 @@ class MainWindow(QMainWindow):
         self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         # Real TradingView candlestick chart; the built-in chart is the
         # fallback when TradingView cannot load (offline / blocked).
+        # Both pages are 480px tall (v0.6.0): the fallback used to have
+        # no minimum height, so a failed TradingView load collapsed
+        # the whole panel and the chart looked invisible.
         self._price_chart = PriceChart(content)
         self._tv_chart = TradingViewChart(self._price_chart, content)
-        tv_note = QLabel(
-            "TradingView chart (live candles) — if it stays blank, the "
-            "built-in chart takes over automatically.", content)
-        tv_note.setProperty("class", "muted")
-        tv_note.setWordWrap(True)
+        self._tv_chart.status_changed.connect(self._update_chart_status)
+        chart_status_row = QHBoxLayout()
+        self._chart_status = QLabel(
+            "TradingView loading…", content)
+        self._chart_status.setWordWrap(True)
+        self._chart_retry_button = QPushButton(
+            "Retry TradingView", content)
+        self._chart_retry_button.setProperty("class", "ghost")
+        self._chart_retry_button.clicked.connect(
+            self._on_retry_tradingview)
+        chart_status_row.addWidget(self._chart_status, 1)
+        chart_status_row.addWidget(self._chart_retry_button)
         range_row = QHBoxLayout()
         self._range_buttons: dict[str, QPushButton] = {}
         for label in ("1D", "5D", "1M", "1Y", "2Y"):
@@ -960,10 +1219,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._price_change)
         layout.addWidget(self._price_source)
         layout.addWidget(self._tv_chart)
-        layout.addWidget(tv_note)
+        layout.addLayout(chart_status_row)
         layout.addLayout(range_row)
         layout.addStretch(1)
-        self._register_panel("price", box)
+        self._register_panel("price", box, wide=True)
+        self._update_chart_status()
 
         # (2) Total score gauge + components.
         box, layout = self._panel("Total score")
@@ -1092,6 +1352,12 @@ class MainWindow(QMainWindow):
         # stored Yahoo history (free; Finnhub's aggregate endpoint
         # is premium-only). Advisory only, never a trade order.
         box, layout = self._panel("Technical summary & setups (advisory)")
+        tech_pills_row = QHBoxLayout()
+        self._tech_signal_pill = _status_pill("—", "grey")
+        self._tech_regime_pill = _status_pill("—", "grey")
+        tech_pills_row.addWidget(self._tech_signal_pill)
+        tech_pills_row.addWidget(self._tech_regime_pill)
+        tech_pills_row.addStretch(1)
         self._technical_label = QLabel(
             "No history yet — refresh to compute RSI / MACD / SMA / ADX.",
             content)
@@ -1101,6 +1367,7 @@ class MainWindow(QMainWindow):
         self._setups_list.setWordWrap(True)
         self._setups_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._setups_list.setMinimumHeight(120)
+        layout.addLayout(tech_pills_row)
         layout.addWidget(self._technical_label)
         layout.addWidget(self._setups_list)
         layout.addStretch(1)
@@ -1153,6 +1420,7 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         central_layout = QVBoxLayout(central)
         central_layout.addWidget(self._header)
+        central_layout.addWidget(self._strip_widget)
         central_layout.addWidget(scroll)
         central_layout.setContentsMargins(8, 4, 8, 4)
         self.setCentralWidget(central)
@@ -1255,6 +1523,11 @@ class MainWindow(QMainWindow):
                 f"{sign}{change:,.2f} ({sign}{pct:.3f}%) since last tick")
             self._price_change.setStyleSheet(f"color: {color};")
         self._price_chart.set_live_tick(tick)
+        # Summary strip price card follows the live tick too.
+        strip_price = self._strip_cards["price"]
+        strip_price["value"].setText(_fmt_value(value))
+        strip_price["sub"].setText(
+            f"{self._price_change.text()} · {source} · ● LIVE")
 
     def _on_live_price_failed(self, message: str) -> None:
         if self._ticker_ok is not False:
@@ -1280,6 +1553,35 @@ class MainWindow(QMainWindow):
             count = {"1M": 22, "1Y": 250, "2Y": 500}[self._chart_range]
             bars = self._chart_bars_daily[-count:]
         self._price_chart.set_bars(bars, self._live_tick)
+
+    def _update_chart_status(self, live: bool | None = None) -> None:
+        """Status line under the chart: TradingView LIVE (green) or
+        the built-in fallback (amber) with a Retry button."""
+        if live is None:
+            live = self._tv_chart.is_live
+        if live:
+            self._chart_status.setText("● TradingView LIVE")
+            self._chart_status.setStyleSheet(
+                f"color: {STATUS_COLORS['ok']};")
+            self._chart_retry_button.setVisible(False)
+        else:
+            self._chart_status.setText(
+                "Built-in chart — TradingView could not load "
+                "(network blocked?). The built-in chart below is live "
+                "data from stored bars.")
+            self._chart_status.setStyleSheet(
+                f"color: {STATUS_COLORS['stale']};")
+            self._chart_retry_button.setVisible(True)
+
+    def _on_retry_tradingview(self) -> None:
+        """Retry button: reload TradingView and restart the watchdog."""
+        self._chart_status.setText("TradingView reloading…")
+        self._chart_status.setStyleSheet(
+            f"color: {STATUS_COLORS['stale']};")
+        self._chart_retry_button.setEnabled(False)
+        self.log("Retrying TradingView chart…")
+        self._tv_chart.reload()
+        self._chart_retry_button.setEnabled(True)
 
     # -------------------------------------------------------------- news
 
@@ -1621,6 +1923,22 @@ class MainWindow(QMainWindow):
         if not payload.get("setups"):
             self._setups_list.addItem(QListWidgetItem(
                 "No setups yet — refresh to evaluate the rules."))
+        # Pills in the Technical Summary panel (v0.6.0) — the same
+        # read as the summary strip, shown next to the detail lines.
+        if tech and tech.get("bars_daily"):
+            signal = str(tech.get("signal", "neutral"))
+            _set_pill(self._tech_signal_pill, signal.upper(),
+                      SIGNAL_PILL_KIND.get(signal.lower(), "grey"))
+            rf = tech.get("regime_filter") or {}
+            label = str(rf.get("label") or "")
+            if label and label != "unknown":
+                _set_pill(self._tech_regime_pill, label.upper(),
+                          REGIME_PILL_KIND.get(label, "grey"))
+            else:
+                _set_pill(self._tech_regime_pill, "—", "grey")
+        else:
+            _set_pill(self._tech_signal_pill, "—", "grey")
+            _set_pill(self._tech_regime_pill, "—", "grey")
         # Volume profile + macro event calendar.
         profile = payload.get("volume_profile") or {}
         self._volume_widget.set_profile(profile)
@@ -1668,6 +1986,9 @@ class MainWindow(QMainWindow):
             self._events_label.setText(
                 "No events in the calendar yet — the bundled list may be "
                 "out of date; check bea.gov / bls.gov / federalreserve.gov.")
+
+        # Summary strip (v0.6.0): the whole analysis at a glance.
+        self._update_summary_strip(payload)
 
     # ------------------------------------------------------------------ alerts
 

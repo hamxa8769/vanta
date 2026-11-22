@@ -243,6 +243,33 @@ def get_latest_snapshot_for_source(db_path: str | Path, source: str) -> SourceSn
     return _row_to_snapshot(row) if row else None
 
 
+def get_snapshot_history(db_path: str | Path, series_id: str,
+                         limit: int = 100) -> list[tuple[datetime | None, float]]:
+    """(date, value) history for one series, oldest first.
+
+    Failed snapshots are excluded (they are not data). The date is
+    the snapshot's ``as_of`` when set, else its ``fetched_at`` —
+    connectors store the observation date in ``as_of``, so 30-day /
+    13-week deltas are computed on data dates, not fetch times.
+    Used by the derived-series step (goldboard_core.derived).
+    """
+    if not Path(db_path).is_file():
+        return []
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT as_of, fetched_at, value FROM snapshots
+               WHERE series_id = ? AND status != 'failed'
+               ORDER BY fetched_at DESC, id DESC LIMIT ?""",
+            (series_id, limit),
+        ).fetchall()
+    history: list[tuple[datetime | None, float]] = []
+    for row in rows:
+        date = _parse(row["as_of"]) or _parse(row["fetched_at"])
+        history.append((date, float(row["value"])))
+    history.reverse()
+    return history
+
+
 # -------------------------------------------------------------------- scores
 
 def save_score(db_path: str | Path, score: ScoreResult) -> int:

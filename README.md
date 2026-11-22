@@ -101,6 +101,24 @@ Raw snapshots are mapped to −100…+100 by `scoring.normalise_snapshot`
 documented table for known series). A raw value on an unknown scale
 maps to `None` — never guessed.
 
+Derived series (v0.6.0): the connectors store raw latest values, but
+the score contract asks for derived quantities, so after every
+refresh the board computes them from stored snapshot history and
+saves them as `source="derived"` snapshots (`is_proxy=True` +
+`proxy_formula`): the COT 52-week percentile, the 13-week GLD+IAU
+ETF flow, and the 30-day changes in the 10y real yield, the broad
+dollar (FRED DTWEXBGS) and the COMEX registered share. Each needs
+its history — the COT percentile needs ≥10 weekly values, the ETF
+flow needs a snapshot ≥12 weeks old, the 30-day changes need a value
+25–35 days old — otherwise it stays `None` and nothing is saved.
+What fills immediately on a fresh install: the COT pillar, because
+the connector's `cot_gold_mm_net_pct_oi` (managed-money net as % of
+OI) is the exact quantity the score's `cot_managed_money_net_pct_oi`
+formula describes, so it maps through the same `clamp(value * 2)`.
+The other pillars fill in over the following weeks as history
+accumulates. The news pillar is untouched: `gdelt_tone_gold` maps
+when the news fetch succeeds.
+
 ## Stable Muuk-facing API (do not change signatures lightly)
 
 ```python
@@ -150,8 +168,29 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.5.0**. Every release bumps the
+carry the same version. Current: **0.6.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.6.0 is the dashboard redesign. A summary strip sits at the top
+of the dashboard — always visible, never hideable — with seven KPI
+cards: live price + change + source, technical signal (pill) with
+buy/sell counts, regime filter (pill) with ER/CHOP, institutional
+score with a verdict word and top component, active setups count
+with the top setup, next macro event with countdown, and the volume
+profile POC with its value area. Every card shows an honest empty
+state before its data arrives. The chart panel is now full-width
+directly under the strip, and the chart itself is robust: both the
+TradingView page and the built-in fallback are 480px tall (the
+fallback used to have no minimum height, so a failed TradingView
+load collapsed the whole panel and the chart looked invisible),
+with a visible status line — "TradingView LIVE" in green, or the
+amber fallback note — and a "Retry TradingView" button that reloads
+it and restarts the watchdog. Styling is modernised on the same
+gold-on-black brand: 12px panel radius, softer borders, 16px
+padding, more spacing, bigger key numbers (price 30px), 14px
+section titles, and status pills for the regime and the technical
+signal (green/amber/red/grey). No data or scoring logic changed —
+display only.
 
 v0.5.0 is the Regime Filter — the market's own answer to "trending
 or choppy?", built from the spec's three independent methods so no

@@ -1,10 +1,10 @@
-"""Frozen e2e check for v0.5.0 (NOT a pytest test).
+"""Frozen e2e check for v0.6.0 (NOT a pytest test).
 
 Launches the frozen dist/Vanta/Vanta binary headless (offscreen)
 with an isolated HOME for ~180s, then inspects the DB it wrote:
 price bars (daily + intraday), snapshots per source, and recomputes
 the technical summary + setups + volume profile from the stored
-real bars to prove the new v0.5.0 panels have real data behind them.
+real bars to prove the new v0.6.0 panels have real data behind them.
 
 Usage: python scripts/e2e_frozen.py [seconds]
 """
@@ -136,6 +136,22 @@ def main() -> int:
     print(f"events (next 60d: {len(events)}):")
     for e in events:
         print(f"  - {e['name']} in {e['days_away']}d ({e['date']})")
+    # Institutional score (v0.6.0): the frozen app's worker runs the
+    # derived step after each refresh, so the score should now fill
+    # from the COT alias on a fresh DB; other pillars need history.
+    from goldboard_core.api import get_features, get_score
+    features = get_features(str(db))
+    score = get_score(str(db))
+    print("features:", {k: (round(v, 1) if v is not None else None)
+                        for k, v in features.items()})
+    if score is not None:
+        print("score:", {
+            "total": round(score.total, 1),
+            "components": [(c.name, round(c.score, 1))
+                           for c in score.components],
+        })
+    else:
+        print("score: None — no pillar has data yet")
     return 0
 
 

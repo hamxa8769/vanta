@@ -139,6 +139,13 @@ EXPLICIT_SERIES: dict[str, str] = {
     # COT managed-money net as % of open interest; +50% of OI is the top
     # of the observed range, so net_pct_oi * 2 spans the scale.
     "cot_managed_money_net_pct_oi": "clamp(value * 2)",
+    # Same quantity under the connector's own id: the CFTC connector
+    # stores "cot_gold_mm_net_pct_oi" (managed-money net as % of OI) —
+    # the alias maps it through the identical formula so the COT pillar
+    # fills from live data instead of staying None. The non-commercial
+    # "cot_gold_nc_net_pct_oi" is deliberately NOT aliased: different
+    # classification, and the pillar must stay faithful to managed money.
+    "cot_gold_mm_net_pct_oi": "clamp(value * 2)",
     # Central-bank reported net buying, trailing 3 months, tonnes.
     # ~300t/quarter is a very strong quarter (Q3 2026 est. 321t).
     "central_bank_net_tonnes_3m": "clamp(value / 3)",
