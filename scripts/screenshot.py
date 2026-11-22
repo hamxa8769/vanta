@@ -31,7 +31,8 @@ from goldboard_core.models import SourceSnapshot  # noqa: E402
 from goldboard_core.storage import init_db, save_snapshot  # noqa: E402
 
 FIXTURE = ROOT / "data" / "fixtures" / "q3_2026_snapshot.json"
-OUT = ROOT / "docs" / "screenshot-dashboard.png"
+OUT_DARK = ROOT / "docs" / "screenshot-dashboard.png"
+OUT_LIGHT = ROOT / "docs" / "screenshot-dashboard-light.png"
 
 NOW = datetime.now(timezone.utc)
 
@@ -84,10 +85,21 @@ def seed_demo_db(db_path: Path) -> None:
 
 
 def main() -> int:
+    """Usage: python scripts/screenshot.py [--theme dark|light]."""
+    theme = "light" if "--theme" in sys.argv and "light" in sys.argv else "dark"
+    out = OUT_LIGHT if theme == "light" else OUT_DARK
     # No network during the screenshot: the background refresh is stubbed
     # and the GitHub update check is disabled entirely.
     worker_mod.refresh_all = lambda db_path: {}
     MainWindow.check_for_updates = lambda self: None  # noqa: ARG005
+    from PySide6.QtCore import QSettings
+
+    from goldboard_core.branding import set_theme
+
+    settings = QSettings("Vanta", "GoldBoard")
+    previous_theme = settings.value("theme", "dark", type=str) or "dark"
+    settings.setValue("theme", theme)
+    set_theme(theme)
     with tempfile.TemporaryDirectory(prefix="vanta-shot-") as tmp:
         db_path = Path(tmp) / "demo.db"
         seed_demo_db(db_path)
@@ -103,8 +115,8 @@ def main() -> int:
         loop.exec()
         app.processEvents()
         pixmap = window.grab()
-        OUT.parent.mkdir(parents=True, exist_ok=True)
-        if pixmap.isNull() or not pixmap.save(str(OUT), "PNG"):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if pixmap.isNull() or not pixmap.save(str(out), "PNG"):
             print("ERROR: screenshot grab failed (null pixmap)", file=sys.stderr)
             return 1
         window.close()
@@ -115,7 +127,9 @@ def main() -> int:
         QTimer.singleShot(500, loop2.quit)
         loop2.exec()
         app.processEvents()
-    print(str(OUT))
+    settings.setValue("theme", previous_theme)
+    set_theme(previous_theme)
+    print(str(out))
     return 0
 
 

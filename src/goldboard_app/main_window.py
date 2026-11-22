@@ -1,11 +1,13 @@
 """Vanta desktop UI (Phase 4) — PySide6/Qt, black + gold, shadow-only.
 
-Single main screen with eleven panels (live price + chart, score gauge,
-COT chart, ETF flow, central-bank buying, macro, live news headlines,
-signals, gates, freshness, history backtest), a live price ticker
-(Yahoo quote every 10s), a live clock, Refresh + auto-refresh on a
-QTimer, refresh in a QThread (never blocks the UI), a Settings page
-for API keys, an in-app updater, threshold alerts, and a log drawer.
+One main screen: a summary strip (the whole analysis at a glance),
+a small chart preview (click to expand into a centred window), and
+the lower panels organised into tabs (Institutions, Macro & News,
+Technical, Signals & Gates, System) — a live price ticker (Yahoo
+quote every 10s), a live clock, Refresh + auto-refresh on a QTimer,
+refresh in a QThread (never blocks the UI), a Settings form in the
+System tab for API keys, an in-app updater, threshold alerts, a log
+drawer, and a dark/light theme toggle.
 
 Honesty rule: every number shows source + timestamp. A failed source
 shows FAILED/STALE — never an invented value. No live trading anywhere.
@@ -17,7 +19,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtCore import (
+    QEvent,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    QUrl,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -33,7 +43,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
-    QDialogButtonBox,
     QDockWidget,
     QFormLayout,
     QFrame,
@@ -53,6 +62,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -62,13 +72,14 @@ from goldboard_core.branding import (
     LOGO_DIR,
     PALETTE,
     get_app_icon_path,
+    set_theme,
 )
 from goldboard_core.config import get_config_path, load_config, save_config
 from goldboard_core.gates import GATE_THRESHOLDS
 from goldboard_data.fedwatch import load_fomc_calendar, next_meetings
 
 from . import __version__
-from .tradingview_chart import TradingViewChart
+from .tradingview_chart import CHART_MIN_HEIGHT, PREVIEW_MIN_HEIGHT, TradingViewChart
 from .updater import (
     NO_CHANNEL_MESSAGE,
     check_for_update_live,
@@ -206,7 +217,7 @@ class ScoreGauge(QWidget):
         bar_y, bar_h = 22, 18
         # Track: bearish (left) → neutral → bullish (right, gold).
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#3A3A3C"))
+        painter.setBrush(QColor(PALETTE["track"]))
         painter.drawRoundedRect(0, bar_y, width // 2, bar_h, 4, 4)
         painter.setBrush(QColor(PALETTE["gold"]))
         painter.drawRoundedRect(width // 2, bar_y, width // 2, bar_h, 4, 4)
@@ -316,6 +327,11 @@ class PriceChart(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         width, height = self.width(), self.height()
+        # Explicit background: the fallback chart must be light in the
+        # light theme (and match TradingView's dark canvas in dark).
+        # A plain QWidget does not paint its own background reliably
+        # from the stylesheet alone, so fill it here.
+        painter.fillRect(0, 0, width, height, QColor(PALETTE["black"]))
         bars = self._bars
         if len(bars) < 2 and self._live_tick is None:
             painter.setPen(QColor(PALETTE["muted"]))
@@ -411,9 +427,9 @@ class VolumeProfileWidget(QWidget):
             if is_poc:
                 painter.setBrush(QColor(PALETTE["gold"]))
             elif in_va:
-                painter.setBrush(QColor("#8a6d2b"))
+                painter.setBrush(QColor(PALETTE["va"]))
             else:
-                painter.setBrush(QColor("#3A3A3C"))
+                painter.setBrush(QColor(PALETTE["track"]))
             painter.setPen(Qt.NoPen)
             painter.drawRect(int(pad_l), int(y) + 1,
                              max(1, int(bar_w)), max(1, int(row_h) - 2))
@@ -541,19 +557,24 @@ class _QuickCheck:
         return resp.json()
 
 
-class SettingsDialog(QDialog):
-    """Settings page: API keys + live intervals.
+class SettingsForm(QWidget):
+    """Settings form: API keys + live intervals (v0.7.0).
 
-    Keys are saved to the config file (never logged); a key that came
-    from the environment is shown read-only. Test buttons verify the
+    Built once as a reusable widget and embedded in the System tab
+    (it used to be a separate SettingsDialog — same fields, same
+    Test buttons, same apply_to(); the dialog is gone). Keys are
+    saved to the config file (never logged); a key that came from
+    the environment is shown read-only. Test buttons verify the
     key against the real provider before saving.
+
+    The MainWindow owns the Save / Reset buttons below the form:
+    Save calls apply_to() then save_config(); Reset calls
+    load_from() to restore the form from the config.
     """
 
     def __init__(self, config, parent=None) -> None:
         super().__init__(parent)
         self.config = config
-        self.setWindowTitle("Settings — API keys & live data")
-        self.setMinimumWidth(560)
         self._test_thread: KeyTestThread | None = None
         self._test_target: str | None = None
 
@@ -561,8 +582,6 @@ class SettingsDialog(QDialog):
 
         self._finnhub_edit = QLineEdit(self)
         self._finnhub_edit.setEchoMode(QLineEdit.Password)
-        self._finnhub_edit.setText(config.finnhub_api_key)
-        self._finnhub_edit.setPlaceholderText("finnhub.io — free, 60 calls/min")
         self._finnhub_status = QLabel("Free key: finnhub.io → API Keys.", self)
         self._finnhub_status.setWordWrap(True)
         self._finnhub_test = QPushButton("Test", self)
@@ -576,8 +595,6 @@ class SettingsDialog(QDialog):
 
         self._fred_edit = QLineEdit(self)
         self._fred_edit.setEchoMode(QLineEdit.Password)
-        self._fred_edit.setText(config.fred_api_key)
-        self._fred_edit.setPlaceholderText("fred.stlouisfed.org — free")
         self._fred_status = QLabel(
             "Free key: fred.stlouisfed.org → My Account → API Keys. "
             "Without it, macro data uses the slow fredgraph.csv fallback.", self)
@@ -592,12 +609,7 @@ class SettingsDialog(QDialog):
 
         self._fedwatch_edit = QLineEdit(self)
         self._fedwatch_edit.setEchoMode(QLineEdit.Password)
-        self._fedwatch_edit.setText(config.fedwatch_api_key)
-        self._fedwatch_edit.setPlaceholderText("$25/mo CME EOD API — optional")
         self._fedwatch_url_edit = QLineEdit(self)
-        self._fedwatch_url_edit.setText(config.fedwatch_api_url)
-        self._fedwatch_url_edit.setPlaceholderText(
-            "Endpoint URL from the CME FedWatch API page")
         self._fedwatch_status = QLabel(
             "Paid ($25/mo): cmegroup.com → Market Data API → FedWatch API. "
             "Without it the board uses the manual FOMC calendar.", self)
@@ -611,39 +623,57 @@ class SettingsDialog(QDialog):
         form.addRow("FedWatch endpoint:", self._fedwatch_url_edit)
         form.addRow("", self._fedwatch_status)
 
-        if config._finnhub_key_from_env:
-            self._finnhub_edit.setReadOnly(True)
-            self._finnhub_status.setText(
-                "Finnhub key comes from the environment "
-                "(GOLD_BOARD_FINNHUB_KEY) — change it there.")
-        if config._fred_key_from_env:
-            self._fred_edit.setReadOnly(True)
-            self._fred_status.setText(
-                "FRED key comes from the environment "
-                "(GOLD_BOARD_FRED_KEY) — change it there.")
-        if config._fedwatch_key_from_env:
-            self._fedwatch_edit.setReadOnly(True)
-            self._fedwatch_url_edit.setReadOnly(True)
-            self._fedwatch_status.setText(
-                "FedWatch key comes from the environment — change it there.")
-
         self._price_spin = QSpinBox(self)
         self._price_spin.setRange(5, 60)
-        self._price_spin.setValue(config.price_refresh_seconds)
         self._price_spin.setSuffix(" s")
         form.addRow("Live price ticker:", self._price_spin)
 
         self._full_spin = QSpinBox(self)
         self._full_spin.setRange(5, 1440)
-        self._full_spin.setValue(config.full_refresh_minutes)
         self._full_spin.setSuffix(" min")
         form.addRow("Full refresh (all sources):", self._full_spin)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addWidget(buttons)
+        self.load_from(config)
+
+    def load_from(self, config) -> None:
+        """(Re)populate the fields from the config (Save's inverse)."""
+        self.config = config
+        self._finnhub_edit.setText(config.finnhub_api_key)
+        self._finnhub_edit.setPlaceholderText("finnhub.io — free, 60 calls/min")
+        self._fred_edit.setText(config.fred_api_key)
+        self._fred_edit.setPlaceholderText("fred.stlouisfed.org — free")
+        self._fedwatch_edit.setText(config.fedwatch_api_key)
+        self._fedwatch_edit.setPlaceholderText("$25/mo CME EOD API — optional")
+        self._fedwatch_url_edit.setText(config.fedwatch_api_url)
+        self._fedwatch_url_edit.setPlaceholderText(
+            "Endpoint URL from the CME FedWatch API page")
+        self._price_spin.setValue(config.price_refresh_seconds)
+        self._full_spin.setValue(config.full_refresh_minutes)
+        self._finnhub_edit.setReadOnly(bool(config._finnhub_key_from_env))
+        self._fred_edit.setReadOnly(bool(config._fred_key_from_env))
+        self._fedwatch_edit.setReadOnly(bool(config._fedwatch_key_from_env))
+        self._fedwatch_url_edit.setReadOnly(bool(config._fedwatch_url_from_env))
+        if config._finnhub_key_from_env:
+            self._finnhub_status.setText(
+                "Finnhub key comes from the environment "
+                "(GOLD_BOARD_FINNHUB_KEY) — change it there.")
+        else:
+            self._finnhub_status.setText("Free key: finnhub.io → API Keys.")
+        if config._fred_key_from_env:
+            self._fred_status.setText(
+                "FRED key comes from the environment "
+                "(GOLD_BOARD_FRED_KEY) — change it there.")
+        else:
+            self._fred_status.setText(
+                "Free key: fred.stlouisfed.org → My Account → API Keys. "
+                "Without it, macro data uses the slow fredgraph.csv fallback.")
+        if config._fedwatch_key_from_env:
+            self._fedwatch_status.setText(
+                "FedWatch key comes from the environment — change it there.")
+        else:
+            self._fedwatch_status.setText(
+                "Paid ($25/mo): cmegroup.com → Market Data API → FedWatch API. "
+                "Without it the board uses the manual FOMC calendar.")
 
     def _test_key(self, kind: str) -> None:
         if self._test_thread is not None and self._test_thread.isRunning():
@@ -678,7 +708,7 @@ class SettingsDialog(QDialog):
             status.setText(message)
 
     def apply_to(self, config) -> None:
-        """Copy the dialog values into the config (call before save)."""
+        """Copy the form values into the config (call before save)."""
         if not config._finnhub_key_from_env:
             config.finnhub_api_key = self._finnhub_edit.text().strip()
         if not config._fred_key_from_env:
@@ -693,6 +723,47 @@ class SettingsDialog(QDialog):
 
 # --------------------------------------------------------------- main window
 
+class ChartDialog(QDialog):
+    """Expanded chart window (v0.7.0) — modeless, centred on screen.
+
+    The dashboard chart is a small preview; this dialog holds the
+    SAME chart widget (reparented, never duplicated — a
+    QWebEngineView cannot live in two places). Modeless so the
+    dashboard keeps live-updating behind it. Closing it emits
+    ``closed`` so the MainWindow can dock the chart back into the
+    preview panel.
+    """
+
+    closed = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Gold price (XAUUSD) — TradingView")
+        self.setWindowFlags(Qt.Window)
+        self.setModal(False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        collapse_row = QHBoxLayout()
+        collapse_row.addStretch(1)
+        self._collapse_button = QPushButton(
+            "⛶ Collapse back to dashboard", self)
+        self._collapse_button.setProperty("class", "ghost")
+        self._collapse_button.clicked.connect(self.close)
+        collapse_row.addWidget(self._collapse_button)
+        layout.addLayout(collapse_row)
+        self._chart_layout = QVBoxLayout()
+        layout.addLayout(self._chart_layout)
+
+    @property
+    def chart_layout(self) -> QVBoxLayout:
+        """Layout the chart container is docked into."""
+        return self._chart_layout
+
+    def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
+        super().closeEvent(event)
+        self.closed.emit()
+
+
 class MainWindow(QMainWindow):
     """Vanta main window — one screen, ten panels, black + gold."""
 
@@ -703,6 +774,15 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.db_path = Path(db_path) if db_path else Path(self.config.db_path)
         self.settings = QSettings("Vanta", "GoldBoard")
+        # Theme (v0.7.0): dark by default; the choice is remembered.
+        # Applied BEFORE the stylesheet is built, so the first paint
+        # already uses the right palette.
+        self._theme = self.settings.value("theme", "dark", type=str) or "dark"
+        if self._theme not in ("dark", "light"):
+            self._theme = "dark"
+        set_theme(self._theme)
+        # Expanded chart dialog (v0.7.0): None while docked in preview.
+        self._chart_dialog: ChartDialog | None = None
         # One-time migration: v0.1.x kept the refresh interval in
         # QSettings; v0.2.0 keeps it in the config file. A config file
         # that predates the field keeps the QSettings value.
@@ -796,19 +876,29 @@ class MainWindow(QMainWindow):
         QPushButton {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
             border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
         QPushButton:hover {{ background: {PALETTE["gold_light"]}; }}
-        QPushButton:disabled {{ background: #3A3A3C; color: {PALETTE["muted"]}; }}
+        QPushButton:disabled {{ background: {PALETTE["track"]}; color: {PALETTE["muted"]}; }}
         QPushButton.ghost {{ background: transparent; color: {PALETTE["gold"]};
             border: 1px solid {PALETTE["gold"]}; }}
-        QPushButton.ghost:hover {{ background: #2a2415; }}
+        QPushButton.ghost:hover {{ background: {PALETTE["hover_bg"]}; }}
+        QPushButton.ghost:checked {{ background: {PALETTE["hover_bg"]}; }}
         QPushButton.gold {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
             border: none; }}
         QMenu {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 6px; padding: 4px; }}
-        QMenu::item:selected {{ background: #2a2415; }}
-        QGroupBox {{ border: 1px solid #2e2a1e; border-radius: 12px;
+        QMenu::item:selected {{ background: {PALETTE["hover_bg"]}; }}
+        QGroupBox {{ border: 1px solid {PALETTE["border"]}; border-radius: 12px;
             margin-top: 14px; padding: 16px; background: {PALETTE["surface"]}; }}
         QGroupBox::title {{ color: {PALETTE["gold"]}; subcontrol-origin: margin;
             left: 8px; padding: 0 4px; font-weight: bold; font-size: 14px; }}
+        QTabWidget::pane {{ border: 1px solid {PALETTE["border"]};
+            border-radius: 8px; background: {PALETTE["black"]}; }}
+        QTabBar::tab {{ background: {PALETTE["surface"]}; color: {PALETTE["muted"]};
+            border: 1px solid {PALETTE["border"]}; border-bottom: none;
+            border-top-left-radius: 8px; border-top-right-radius: 8px;
+            padding: 8px 18px; font-weight: bold; }}
+        QTabBar::tab:selected {{ background: {PALETTE["black"]};
+            color: {PALETTE["gold"]}; border-bottom: 2px solid {PALETTE["gold"]}; }}
+        QTabBar::tab:hover {{ color: {PALETTE["text"]}; }}
         QSpinBox {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 4px; padding: 3px; }}
         QLineEdit {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
@@ -820,6 +910,61 @@ class MainWindow(QMainWindow):
             color: {PALETTE["text"]}; border: 1px solid {PALETTE["gold"]}; }}
         QScrollArea {{ border: none; }}
         """
+
+    # ------------------------------------------------------------------ theme
+
+    def _sync_theme_controls(self) -> None:
+        """Header toggle + Settings-tab checkbox follow _theme."""
+        light = self._theme == "light"
+        if hasattr(self, "_theme_button"):
+            self._theme_button.setChecked(light)
+            self._theme_button.setText("🌙 Dark" if light else "☀ Light")
+        if hasattr(self, "_theme_check"):
+            self._theme_check.setChecked(light)
+
+    def _toggle_theme(self) -> None:
+        """Flip dark/light, persist, and repaint everything."""
+        self._theme = "light" if self._theme == "dark" else "dark"
+        self.settings.setValue("theme", self._theme)
+        self._apply_theme()
+        self.log(f"Theme switched to {self._theme}.")
+
+    def _apply_theme(self) -> None:
+        """Re-apply the active palette everywhere it shows.
+
+        The global stylesheet is rebuilt from PALETTE, inline
+        stylesheets (strip cards, price value) are refreshed, the
+        custom painters repaint, and the TradingView embed reloads
+        with its own light/dark theme.
+        """
+        set_theme(self._theme)
+        self.setStyleSheet(self._stylesheet())
+        if self._chart_dialog is not None:
+            self._chart_dialog.setStyleSheet(self._stylesheet())
+        self._refresh_strip_styles()
+        self._price_value.setStyleSheet(f"color: {PALETTE['gold_light']};")
+        for widget in (self._gauge, self._cot_chart, self._price_chart,
+                       self._volume_widget):
+            widget.update()
+        self._tv_chart.set_theme(self._theme)
+        self._sync_theme_controls()
+
+    def _refresh_strip_styles(self) -> None:
+        """Re-apply the strip cards' inline styles for the theme."""
+        for card in self._strip_cards.values():
+            card["frame"].setStyleSheet(self._kpi_card_style())
+            value = card["value"]
+            # Pill values restyle themselves via _set_pill (fixed
+            # functional colours); plain values use gold_light.
+            if value.property("kpi_plain") is True:
+                value.setStyleSheet(f"color: {PALETTE['gold_light']};")
+
+    @staticmethod
+    def _kpi_card_style() -> str:
+        """Frame stylesheet for a strip card (theme-aware)."""
+        return (f"#kpiCard {{ background: {PALETTE['surface']}; "
+                f"border: 1px solid {PALETTE['border']}; border-radius: 12px; "
+                "padding: 10px; }")
 
     # ------------------------------------------------------------------ build
 
@@ -865,8 +1010,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._clock_label)
         self._settings_button = QPushButton("Settings", header)
         self._settings_button.setProperty("class", "ghost")
-        self._settings_button.clicked.connect(self._open_settings)
+        self._settings_button.clicked.connect(self._show_settings_tab)
         layout.addWidget(self._settings_button)
+        # Theme toggle (v0.7.0): header button + the same toggle in
+        # the Settings tab. Persisted in QSettings ("theme").
+        self._theme_button = QPushButton(header)
+        self._theme_button.setProperty("class", "ghost")
+        self._theme_button.setCheckable(True)
+        self._theme_button.clicked.connect(self._toggle_theme)
+        layout.addWidget(self._theme_button)
+        self._sync_theme_controls()
         # Update button is ALWAYS visible now: before v0.4.0 it only
         # appeared after a successful check found a newer release, so
         # a failed or pre-release check left the user with no button
@@ -906,12 +1059,50 @@ class MainWindow(QMainWindow):
     # the noisiest panel and the board stays usable without it.
     _PANEL_DEFAULTS = {"freshness": False}
 
+    # Tabs for the lower panels (v0.7.0): the board used to be one
+    # long 3-column scrolling grid, so finding a panel meant hunting.
+    # Each tab holds its panels in a 3-column grid; the summary strip
+    # and the chart preview stay ABOVE the tabs, always visible.
+    _TAB_SPECS = [
+        ("institutions", "Institutions"),
+        ("macro_news", "Macro and News"),
+        ("technical", "Technical"),
+        ("signals", "Signals and Gates"),
+        ("system", "System"),
+    ]
+
+    def _build_tabs(self) -> None:
+        """QTabWidget with one scrolling page per tab."""
+        self._tabs = QTabWidget(self)
+        self._tab_pages: dict[str, QScrollArea] = {}
+        self._tab_content: dict[str, QWidget] = {}
+        self._tab_grids: dict[str, QGridLayout] = {}
+        self._tab_index: dict[str, int] = {}
+        for key, title in self._TAB_SPECS:
+            scroll = QScrollArea(self)
+            scroll.setWidgetResizable(True)
+            content = QWidget(scroll)
+            grid = QGridLayout(content)
+            grid.setSpacing(14)
+            grid.setVerticalSpacing(16)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(2, 1)
+            content.setLayout(grid)
+            scroll.setWidget(content)
+            self._tab_pages[key] = scroll
+            self._tab_content[key] = content
+            self._tab_grids[key] = grid
+            self._tab_index[key] = self._tabs.addTab(scroll, title)
+
     def _register_panel(self, key: str, box: QGroupBox,
-                        wide: bool = False) -> None:
+                        wide: bool = False, tab: str | None = None,
+                        hideable: bool = True) -> None:
         visible = self.settings.value(
             f"panels/{key}",
             self._PANEL_DEFAULTS.get(key, True), type=bool)
-        self._panels.append({"key": key, "box": box, "wide": wide})
+        self._panels.append({"key": key, "box": box, "wide": wide,
+                             "tab": tab, "hideable": hideable})
         # Track visibility in a dict, not box.isVisible(): during
         # __init__ the window is not shown yet, so isVisible() is
         # False for every panel and the relayout would add nothing.
@@ -919,31 +1110,46 @@ class MainWindow(QMainWindow):
         box.setVisible(bool(visible))
 
     def _relayout_panels(self) -> None:
-        """Re-flow the visible panels in order, 3 per row."""
-        grid = self._grid
-        while grid.count():
-            grid.takeAt(0)
-        row, col = 0, 0
-        for panel in self._panels:
-            if not self._panel_visible.get(panel["key"], True):
-                continue
-            box = panel["box"]
-            if panel["wide"]:
-                if col:
+        """Re-flow the visible panels into their tabs, 3 per row.
+
+        A tab with no visible panels is hidden entirely; unhiding
+        any panel in it restores the tab.
+        """
+        for tab_key, _title in self._TAB_SPECS:
+            grid = self._tab_grids[tab_key]
+            while grid.count():
+                grid.takeAt(0)
+            row, col = 0, 0
+            any_visible = False
+            for panel in self._panels:
+                if panel.get("tab") != tab_key:
+                    continue
+                if not self._panel_visible.get(panel["key"], True):
+                    continue
+                any_visible = True
+                box = panel["box"]
+                if panel["wide"]:
+                    if col:
+                        row += 1
+                        col = 0
+                    grid.addWidget(box, row, 0, 1, 3)
                     row += 1
-                    col = 0
-                grid.addWidget(box, row, 0, 1, 3)
-                row += 1
-            else:
-                grid.addWidget(box, row, col)
-                col += 1
-                if col == 3:
-                    col = 0
-                    row += 1
+                else:
+                    grid.addWidget(box, row, col)
+                    col += 1
+                    if col == 3:
+                        col = 0
+                        row += 1
+            self._tabs.setTabVisible(self._tab_index[tab_key], any_visible)
 
     def _build_panels_menu(self) -> None:
         self._panels_menu.clear()
         for panel in self._panels:
+            # Core dashboard elements (chart preview, settings) are
+            # not hideable: hiding them would strand the user with
+            # no way back except the menu they just used.
+            if not panel.get("hideable", True):
+                continue
             action = QAction(panel["box"].title(), self)
             action.setCheckable(True)
             action.setChecked(self._panel_visible.get(panel["key"], True))
@@ -985,10 +1191,7 @@ class MainWindow(QMainWindow):
         # wrap each of them in its own bordered box (and inflate the
         # strip to ~270px tall).
         frame.setObjectName("kpiCard")
-        frame.setStyleSheet(
-            f"#kpiCard {{ background: {PALETTE['surface']}; "
-            "border: 1px solid #2e2a1e; border-radius: 12px; "
-            "padding: 10px; }")
+        frame.setStyleSheet(self._kpi_card_style())
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
@@ -1006,6 +1209,7 @@ class MainWindow(QMainWindow):
             value = QLabel("—", frame)
             value.setFont(_font(value_size, bold=True))
             value.setStyleSheet(f"color: {PALETTE['gold_light']};")
+            value.setProperty("kpi_plain", True)
             value.setWordWrap(wrap_value)
             layout.addWidget(value)
         sub = QLabel("No data yet", frame)
@@ -1163,17 +1367,17 @@ class MainWindow(QMainWindow):
         self._panels: list[dict] = []
         self._panel_visible: dict[str, bool] = {}
         self._build_summary_strip()
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        content = QWidget(scroll)
-        grid = QGridLayout(content)
-        grid.setSpacing(14)
-        grid.setVerticalSpacing(16)
-        self._grid = grid
+        self._build_tabs()
 
         # (1) Gold price + TradingView chart — full width, directly
-        # under the summary strip (v0.6.0: wide=True).
+        # under the summary strip and ABOVE the tabs (v0.7.0: a small
+        # ~240px preview; clicking it opens the centred expand dialog).
+        # Not in a tab and not hideable: it is a core dashboard
+        # element, like the strip.
+        content = QWidget(self)
         box, layout = self._panel("Gold price (XAUUSD) — LIVE · TradingView")
+        self._price_box = box
+        self._price_layout = layout
         self._price_value = QLabel("—", content)
         self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._price_value.setFont(_font(30, bold=True))
@@ -1184,13 +1388,25 @@ class MainWindow(QMainWindow):
         self._price_source.setProperty("class", "muted")
         self._price_source.setWordWrap(True)
         self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Expand affordance: a button in the panel header row, and a
+        # click on the chart area itself (see eventFilter).
+        expand_row = QHBoxLayout()
+        expand_row.addStretch(1)
+        self._expand_button = QPushButton("⛶ Expand chart", content)
+        self._expand_button.setProperty("class", "ghost")
+        self._expand_button.setToolTip(
+            "Open the chart large in a centred window "
+            "(or click the chart itself)")
+        self._expand_button.clicked.connect(self._expand_chart)
+        expand_row.addWidget(self._expand_button)
         # Real TradingView candlestick chart; the built-in chart is the
         # fallback when TradingView cannot load (offline / blocked).
-        # Both pages are 480px tall (v0.6.0): the fallback used to have
-        # no minimum height, so a failed TradingView load collapsed
-        # the whole panel and the chart looked invisible.
+        # The chart + status + retry + range buttons live in one
+        # container that moves into the expand dialog and back.
         self._price_chart = PriceChart(content)
-        self._tv_chart = TradingViewChart(self._price_chart, content)
+        self._tv_chart = TradingViewChart(self._price_chart, content,
+                                          theme=self._theme)
+        self._tv_chart.set_min_height(PREVIEW_MIN_HEIGHT)
         self._tv_chart.status_changed.connect(self._update_chart_status)
         chart_status_row = QHBoxLayout()
         self._chart_status = QLabel(
@@ -1215,17 +1431,36 @@ class MainWindow(QMainWindow):
             self._range_buttons[label] = btn
             range_row.addWidget(btn)
         range_row.addStretch(1)
+        self._chart_container = QWidget(content)
+        container_layout = QVBoxLayout(self._chart_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self._tv_chart)
+        container_layout.addLayout(chart_status_row)
+        container_layout.addLayout(range_row)
+        # Placeholder shown in the preview while the chart is expanded.
+        self._chart_placeholder = QWidget(content)
+        ph_layout = QHBoxLayout(self._chart_placeholder)
+        ph_label = QLabel("Chart is open in the expanded window.", content)
+        ph_label.setProperty("class", "muted")
+        self._restore_button = QPushButton("Show chart here", content)
+        self._restore_button.setProperty("class", "ghost")
+        self._restore_button.clicked.connect(self._collapse_chart)
+        ph_layout.addWidget(ph_label, 1)
+        ph_layout.addWidget(self._restore_button)
+        self._chart_placeholder.setVisible(False)
         layout.addWidget(self._price_value)
         layout.addWidget(self._price_change)
         layout.addWidget(self._price_source)
-        layout.addWidget(self._tv_chart)
-        layout.addLayout(chart_status_row)
-        layout.addLayout(range_row)
+        layout.addLayout(expand_row)
+        layout.addWidget(self._chart_container)
+        layout.addWidget(self._chart_placeholder)
         layout.addStretch(1)
-        self._register_panel("price", box, wide=True)
+        self._register_panel("price", box, wide=True, hideable=False)
         self._update_chart_status()
+        self._install_chart_click_filters()
 
         # (2) Total score gauge + components.
+        content = self._tab_content["institutions"]
         box, layout = self._panel("Total score")
         self._gauge = ScoreGauge(content)
         self._score_value = QLabel("No score yet — no data.", content)
@@ -1237,7 +1472,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._gauge)
         layout.addWidget(self._score_value)
         layout.addWidget(self._components_list)
-        self._register_panel("score", box)
+        self._register_panel("score", box, tab="institutions")
 
         # (3) COT chart.
         box, layout = self._panel("COT — managed-money net (contracts)")
@@ -1247,7 +1482,7 @@ class MainWindow(QMainWindow):
         self._cot_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._cot_chart)
         layout.addWidget(self._cot_summary)
-        self._register_panel("cot", box)
+        self._register_panel("cot", box, tab="institutions")
 
         # (4) ETF flow.
         box, layout = self._panel("ETF flow — GLD / IAU")
@@ -1256,7 +1491,7 @@ class MainWindow(QMainWindow):
         self._etf_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._etf_label)
         layout.addStretch(1)
-        self._register_panel("etf", box)
+        self._register_panel("etf", box, tab="institutions")
 
         # (5) Central-bank buying.
         box, layout = self._panel("Central-bank buying")
@@ -1269,16 +1504,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._cb_label)
         layout.addWidget(note)
         layout.addStretch(1)
-        self._register_panel("central_bank", box)
+        self._register_panel("central_bank", box, tab="institutions")
 
         # (6) Macro.
+        content = self._tab_content["macro_news"]
         box, layout = self._panel("Macro — rates / USD / Fed")
         self._macro_label = QLabel("No macro data yet.", content)
         self._macro_label.setWordWrap(True)
         self._macro_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self._macro_label)
         layout.addStretch(1)
-        self._register_panel("macro", box)
+        self._register_panel("macro", box, tab="macro_news")
 
         # (7) News / sentiment — live headlines (click to open).
         box, layout = self._panel("Live news & sentiment")
@@ -1293,9 +1529,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._news_label)
         layout.addWidget(self._news_list)
         layout.addStretch(1)
-        self._register_panel("news", box)
+        self._register_panel("news", box, tab="macro_news")
 
         # (8) Signals.
+        content = self._tab_content["signals"]
         box, layout = self._panel("Signals (advisory, shadow only)")
         self._signal_label = QLabel("No signal yet — no data.", content)
         self._signal_label.setWordWrap(True)
@@ -1306,7 +1543,7 @@ class MainWindow(QMainWindow):
         self._signal_list.setMinimumHeight(120)
         layout.addWidget(self._signal_label)
         layout.addWidget(self._signal_list)
-        self._register_panel("signals", box)
+        self._register_panel("signals", box, tab="signals")
 
         # (9) Gates.
         box, layout = self._panel("Validation gates G0–G8")
@@ -1320,18 +1557,20 @@ class MainWindow(QMainWindow):
         self._gates_list.setMinimumHeight(120)
         layout.addWidget(self._gates_banner)
         layout.addWidget(self._gates_list)
-        self._register_panel("gates", box)
+        self._register_panel("gates", box, tab="signals")
 
         # (10) Data freshness.
+        content = self._tab_content["system"]
         box, layout = self._panel("Data freshness")
         self._freshness_list = QListWidget(content)
         self._freshness_list.setWordWrap(True)
         self._freshness_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._freshness_list.setMinimumHeight(150)
         layout.addWidget(self._freshness_list)
-        self._register_panel("freshness", box, wide=True)
+        self._register_panel("freshness", box, wide=True, tab="system")
 
         # (11) History backtest.
+        content = self._tab_content["technical"]
         box, layout = self._panel("Backtest on history (real OHLC)")
         self._backtest_label = QLabel(
             "No history yet — refresh to fetch 2y daily + 5d intraday bars.",
@@ -1346,7 +1585,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._backtest_label)
         layout.addLayout(bt_row)
         layout.addStretch(1)
-        self._register_panel("backtest", box, wide=True)
+        self._register_panel("backtest", box, wide=True, tab="technical")
 
         # (12) Technical summary + setups — computed locally from
         # stored Yahoo history (free; Finnhub's aggregate endpoint
@@ -1371,7 +1610,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._technical_label)
         layout.addWidget(self._setups_list)
         layout.addStretch(1)
-        self._register_panel("technical", box, wide=True)
+        self._register_panel("technical", box, wide=True, tab="technical")
 
         # (13) Volume Profile — where trading actually happened (free,
         # from stored intraday bars). True bid/ask footprint needs paid
@@ -1393,9 +1632,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._volume_label)
         layout.addWidget(foot_note)
         layout.addStretch(1)
-        self._register_panel("volume", box)
+        self._register_panel("volume", box, tab="technical")
 
         # (14) Macro event calendar — the Live Research Engine diary.
+        content = self._tab_content["macro_news"]
         box, layout = self._panel("Macro events — what is next (PCE / jobs / FOMC)")
         self._events_label = QLabel("No events in the calendar yet.", content)
         self._events_label.setWordWrap(True)
@@ -1407,21 +1647,48 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._events_label)
         layout.addWidget(self._events_list)
         layout.addStretch(1)
-        self._register_panel("events", box)
+        self._register_panel("events", box, tab="macro_news")
 
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
+        # (15) Settings — the same form the old SettingsDialog had
+        # (API keys with Test buttons + live intervals), now embedded
+        # in the System tab. Not hideable: the System tab must always
+        # have somewhere to go.
+        content = self._tab_content["system"]
+        box, layout = self._panel("Settings — API keys & live data")
+        self._settings_form = SettingsForm(self.config, content)
+        layout.addWidget(self._settings_form)
+        theme_row = QHBoxLayout()
+        self._theme_check = QCheckBox("☀ Light theme", content)
+        self._theme_check.setChecked(self._theme == "light")
+        self._theme_check.toggled.connect(
+            lambda checked: self._set_theme_from_check(checked))
+        theme_row.addWidget(self._theme_check)
+        theme_row.addStretch(1)
+        layout.addLayout(theme_row)
+        settings_row = QHBoxLayout()
+        self._settings_save_button = QPushButton("Save settings", content)
+        self._settings_save_button.clicked.connect(
+            self._save_settings_from_form)
+        self._settings_reset_button = QPushButton("Reset", content)
+        self._settings_reset_button.setProperty("class", "ghost")
+        self._settings_reset_button.clicked.connect(
+            self._reset_settings_form)
+        settings_row.addWidget(self._settings_save_button)
+        settings_row.addWidget(self._settings_reset_button)
+        settings_row.addStretch(1)
+        layout.addLayout(settings_row)
+        self._register_panel("settings", box, wide=True, tab="system",
+                             hideable=False)
+
         self._relayout_panels()
         self._build_panels_menu()
-        content.setLayout(grid)
-        scroll.setWidget(content)
 
         central = QWidget(self)
         central_layout = QVBoxLayout(central)
         central_layout.addWidget(self._header)
         central_layout.addWidget(self._strip_widget)
-        central_layout.addWidget(scroll)
+        central_layout.addWidget(self._price_box)
+        central_layout.addWidget(self._tabs, 1)
         central_layout.setContentsMargins(8, 4, 8, 4)
         self.setCentralWidget(central)
 
@@ -1461,11 +1728,17 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- settings
 
-    def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.config, self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        dialog.apply_to(self.config)
+    def _show_settings_tab(self) -> None:
+        """Header Settings button: switch to the System tab (v0.7.0).
+
+        The settings form lives there now — no separate dialog.
+        """
+        self._tabs.setCurrentIndex(self._tab_index["system"])
+
+    def _save_settings_from_form(self) -> None:
+        """Save button in the System tab: persist + apply, as the
+        old dialog's Save did."""
+        self._settings_form.apply_to(self.config)
         save_config(self.config)
         self.config = load_config()
         self._interval_spin.setValue(self.config.full_refresh_minutes)
@@ -1476,6 +1749,17 @@ class MainWindow(QMainWindow):
             "Settings saved — keys apply on the next refresh.")
         # Keys changed: refresh now so the new sources show up.
         self._startup_refresh_timer.start(500)
+
+    def _reset_settings_form(self) -> None:
+        """Reset button: restore the form from the saved config."""
+        self._settings_form.load_from(self.config)
+        self.log("Settings form reset to saved values.")
+
+    def _set_theme_from_check(self, checked: bool) -> None:
+        """Settings-tab theme checkbox: same toggle as the header."""
+        want = "light" if checked else "dark"
+        if want != self._theme:
+            self._toggle_theme()
 
     # ------------------------------------------------------------ live ticker
 
@@ -1582,6 +1866,73 @@ class MainWindow(QMainWindow):
         self.log("Retrying TradingView chart…")
         self._tv_chart.reload()
         self._chart_retry_button.setEnabled(True)
+
+    # ------------------------------------------------- chart expand / dock
+
+    def _install_chart_click_filters(self) -> None:
+        """Clicking either chart page expands it (the preview is a
+        thumbnail; interaction happens in the expanded window)."""
+        for i in range(self._tv_chart.count()):
+            page = self._tv_chart.widget(i)
+            if page is not None:
+                page.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: D102 — Qt hook
+        if (self._chart_dialog is None
+                and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton):
+            for i in range(self._tv_chart.count()):
+                if watched is self._tv_chart.widget(i):
+                    # A click on the preview opens the big window; the
+                    # click itself is consumed so TradingView does not
+                    # also act on it.
+                    self._expand_chart()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _expand_chart(self) -> None:
+        """Move the chart container into a centred modeless dialog."""
+        if self._chart_dialog is not None:
+            self._chart_dialog.raise_()
+            self._chart_dialog.activateWindow()
+            return
+        dialog = ChartDialog(self)
+        dialog.setStyleSheet(self._stylesheet())
+        dialog.closed.connect(self._on_chart_dialog_closed)
+        screen = QApplication.primaryScreen().availableGeometry()
+        width = min(1150, max(400, screen.width() - 40))
+        height = min(720, max(300, screen.height() - 40))
+        x = screen.x() + (screen.width() - width) // 2
+        y = screen.y() + (screen.height() - height) // 2
+        dialog.setGeometry(x, y, width, height)
+        # The SAME chart widget moves — a QWebEngineView cannot live
+        # in two places, so it is never duplicated.
+        dialog.chart_layout.addWidget(self._chart_container)
+        self._tv_chart.set_min_height(CHART_MIN_HEIGHT)
+        self._chart_placeholder.setVisible(True)
+        self._expand_button.setEnabled(False)
+        self._chart_dialog = dialog
+        dialog.show()
+        self.log("Chart expanded to a centred window.")
+
+    def _on_chart_dialog_closed(self) -> None:
+        """Dialog closed (X or Collapse): dock the chart back."""
+        dialog = self._chart_dialog
+        self._chart_dialog = None
+        if dialog is not None:
+            dialog.chart_layout.removeWidget(self._chart_container)
+        layout = self._price_layout
+        layout.insertWidget(layout.indexOf(self._chart_placeholder),
+                            self._chart_container)
+        self._tv_chart.set_min_height(PREVIEW_MIN_HEIGHT)
+        self._chart_placeholder.setVisible(False)
+        self._expand_button.setEnabled(True)
+
+    def _collapse_chart(self) -> None:
+        """Placeholder button: close the dialog (its closeEvent
+        docks the chart back — one code path, no reentrancy)."""
+        if self._chart_dialog is not None:
+            self._chart_dialog.close()
 
     # -------------------------------------------------------------- news
 
@@ -2129,6 +2480,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
         self._closed = True
+        # Dock the chart back first: the expand dialog is a child, so
+        # it would close anyway — but closing it explicitly re-parents
+        # the chart container into the preview (no dangling widget).
+        if self._chart_dialog is not None:
+            self._chart_dialog.close()
         self._clock_timer.stop()
         self._refresh_timer.stop()
         # Stop the startup timers first: a pending refresh/update/ticker

@@ -168,8 +168,27 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.6.0**. Every release bumps the
+carry the same version. Current: **0.7.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.7.0 is the chart preview + tabs + settings + light theme. The
+dashboard chart is now a small ~240px preview: the "⛶ Expand chart"
+button — or a click on the chart itself — opens it large in a
+centred, modeless window (~1150×720) holding the SAME chart widget
+(reparented, never duplicated), with the status line, Retry button
+and range buttons travelling with it; closing the window docks the
+chart back into the preview. The lower panels are now top tabs
+(Institutions, Macro and News, Technical, Signals and Gates, System) —
+the summary strip and the chart preview stay above the tabs, always
+visible — and the header Panels menu still hides/shows panels inside
+their tabs (a tab with no visible panels hides itself). Settings
+moved from a separate dialog into the System tab (same form: API keys
+with Test buttons + live intervals, with Save / Reset), and the
+header Settings button switches to that tab. A light theme joins the
+dark one: a "☀ Light" toggle in the header and in the Settings tab,
+remembered in QSettings, switching the palette, the TradingView embed
+theme, and every custom-painted chart. No data, scoring, or setup
+logic changed — display and layout only.
 
 v0.6.0 is the dashboard redesign. A summary strip sits at the top
 of the dashboard — always visible, never hideable — with seven KPI

@@ -208,28 +208,54 @@ def test_main_window_has_live_widgets(tmp_path, monkeypatch, qapp):
     window.close()
 
 
-def test_settings_dialog_saves_keys(tmp_path, monkeypatch, qapp):
-    """v0.2.0: settings dialog round-trips keys + intervals to config."""
-    from goldboard_app.main_window import SettingsDialog
+def test_settings_form_saves_keys(tmp_path, monkeypatch, qapp):
+    """v0.7.0: the settings FORM (was a dialog) round-trips keys +
+    intervals to config; the header Settings button switches to the
+    System tab instead of opening a dialog."""
+    from goldboard_app.main_window import SettingsForm
     from goldboard_core.config import load_config
 
     monkeypatch.setenv("GOLD_BOARD_CONFIG_DIR", str(tmp_path / "cfg"))
     cfg = load_config()
-    dialog = SettingsDialog(cfg)
-    dialog._finnhub_edit.setText("fh-test-key")
-    dialog._fred_edit.setText("fred-test-key")
-    dialog._fedwatch_edit.setText("fw-test-key")
-    dialog._fedwatch_url_edit.setText("https://example.invalid/fw")
-    dialog._price_spin.setValue(5)
-    dialog._full_spin.setValue(30)
-    dialog.apply_to(cfg)
+    form = SettingsForm(cfg)
+    form._finnhub_edit.setText("fh-test-key")
+    form._fred_edit.setText("fred-test-key")
+    form._fedwatch_edit.setText("fw-test-key")
+    form._fedwatch_url_edit.setText("https://example.invalid/fw")
+    form._price_spin.setValue(5)
+    form._full_spin.setValue(30)
+    form.apply_to(cfg)
     assert cfg.finnhub_api_key == "fh-test-key"
     assert cfg.fred_api_key == "fred-test-key"
     assert cfg.fedwatch_api_key == "fw-test-key"
     assert cfg.fedwatch_api_url == "https://example.invalid/fw"
     assert cfg.price_refresh_seconds == 5
     assert cfg.full_refresh_minutes == 30
-    dialog.close()
+    # Reset restores the form from the config.
+    form._finnhub_edit.setText("changed")
+    form.load_from(cfg)
+    assert form._finnhub_edit.text() == "fh-test-key"
+    form.close()
+
+
+def test_settings_button_switches_to_system_tab(tmp_path, monkeypatch, qapp):
+    """v0.7.0: header Settings switches to the System tab, where the
+    form lives; the Save button persists it to the config file."""
+    from goldboard_core.config import load_config
+
+    monkeypatch.setenv("GOLD_BOARD_CONFIG_DIR", str(tmp_path / "cfg"))
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    assert window._tabs.currentIndex() != window._tab_index["system"]
+    window._settings_button.click()
+    qapp.processEvents()
+    assert window._tabs.currentIndex() == window._tab_index["system"]
+    assert window._settings_form is not None
+    # Save persists through the form.
+    window._settings_form._finnhub_edit.setText("fh-saved-key")
+    window._settings_save_button.click()
+    qapp.processEvents()
+    assert load_config().finnhub_api_key == "fh-saved-key"
+    window.close()
 
 
 def test_run_history_backtest_on_seeded_bars(tmp_path):
@@ -386,10 +412,14 @@ def test_update_button_always_visible(tmp_path, monkeypatch, qapp):
 
 def test_panels_menu_hides_and_restores(tmp_path, monkeypatch, qapp):
     """v0.4.0: hiding a panel from the Panels menu removes it from
-    the grid and remembers the choice in QSettings."""
+    its tab and remembers the choice in QSettings. (v0.7.0: panels
+    live in tabs now, so the tab must be current before isVisible()
+    means anything — a panel in a background tab is hidden by Qt.)"""
     window = _open_window(tmp_path, monkeypatch, qapp)
     assert window._panels_button is not None
     assert window._panels_menu is not None
+    window._tabs.setCurrentIndex(window._tab_index["macro_news"])
+    qapp.processEvents()
     news_box = next(p["box"] for p in window._panels
                     if p["key"] == "news")
     assert news_box.isVisible()
