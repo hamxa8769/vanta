@@ -125,8 +125,13 @@ def test_click_on_preview_chart_expands(tmp_path, monkeypatch, qapp,
     """v0.7.0: clicking the preview chart area opens the dialog."""
     window = _open_window(tmp_path, monkeypatch, qapp)
     qapp.processEvents()
-    # TradingView cannot load in this VM, so the fallback page is
-    # current; click it (the event filter catches the press).
+    # Force the fallback deterministically: in CI the WebEngine page
+    # loads (network reachable) and the 20s watchdog has not fired
+    # yet, so "TradingView cannot load here" is not true at once —
+    # the old assertion failed there on both runners. The click
+    # behaviour itself does not depend on which page is current.
+    window._tv_chart.show_fallback()
+    qapp.processEvents()
     fallback = window._price_chart
     assert window._tv_chart.currentWidget() is fallback
     QTest.mouseClick(fallback, Qt.LeftButton)
