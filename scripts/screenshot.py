@@ -19,6 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Chromium runs as root in this VM: without --no-sandbox its zygote
+# process aborts and the TradingView page never loads.
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                      "--no-sandbox --disable-gpu")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -85,9 +89,26 @@ def seed_demo_db(db_path: Path) -> None:
 
 
 def main() -> int:
-    """Usage: python scripts/screenshot.py [--theme dark|light]."""
-    theme = "light" if "--theme" in sys.argv and "light" in sys.argv else "dark"
+    """Usage: python scripts/screenshot.py [--theme dark|light]
+    [--size WxH]. Default size is 1400x950; --size 1366x768 is the
+    user's screen (v0.7.1 layout check)."""
+    args = sys.argv[1:]
+    theme = "light" if "light" in args else "dark"
     out = OUT_LIGHT if theme == "light" else OUT_DARK
+    width, height = 1400, 950
+    for arg in args:
+        if arg.startswith("--size="):
+            try:
+                width, height = (int(part) for part in
+                                 arg.split("=", 1)[1].split("x", 1))
+            except ValueError:
+                print("ERROR: --size must be WxH, e.g. --size=1366x768",
+                      file=sys.stderr)
+                return 2
+    if (width, height) != (1400, 950):
+        suffix = "-light" if theme == "light" else ""
+        out = out.with_name(
+            f"screenshot-dashboard-{width}x{height}{suffix}.png")
     # No network during the screenshot: the background refresh is stubbed
     # and the GitHub update check is disabled entirely.
     worker_mod.refresh_all = lambda db_path: {}
@@ -105,7 +126,7 @@ def main() -> int:
         seed_demo_db(db_path)
         app = QApplication(sys.argv)
         window = MainWindow(db_path=db_path)
-        window.resize(1400, 950)
+        window.resize(width, height)
         window.show()
         app.processEvents()
         # Let the window paint (header clock, gauge, chart, lists).

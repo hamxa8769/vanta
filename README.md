@@ -168,8 +168,38 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.7.0**. Every release bumps the
+carry the same version. Current: **0.7.1**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.7.1 fixes the two layout bugs the user reported on his Windows
+machine with v0.7.0 screenshots. (1) The live TradingView chart
+rendered as a thin ~150px band at the top of its container — preview
+and expanded dialog alike — with a huge empty area below it. Root
+cause, verified against the embed script served by
+s3.tradingview.com: the script sets the widget container to
+`height: 100%` and the iframe to `height: 100%` of it but never
+listens for resize and never re-measures, and our HTML set no height
+on `html`/`body`, so the percentage chain collapsed and the iframe
+fell back to the HTML default of 150px. The embed HTML now has
+`html, body` at `height: 100%`, and a `refresh_size()` forces the
+container + iframe to the viewport height in pixels and dispatches a
+resize event — called debounced on resize, once on first show, when
+the iframe goes live, and after reparenting into the expand dialog;
+if a probe still finds the iframe far below the viewport, the HTML
+reloads once at the current size. (2) On a 1366×768 screen the tab
+content area was only ~85px tall and unreachable. The price panel
+was compacted (price + change + Expand on one row, one short source
+line, status + Retry + range buttons on one merged row that travels
+into the dialog, preview 240px → 200px), the header was tightened,
+and the Logs drawer now starts hidden (Panels menu → Logs brings it
+back, remembered in QSettings). A second, subtler cause: the
+QWebEngineView reports an 800×600 sizeHint, which the layout was
+handing to the price panel and squeezing the tabs to ~100px — the
+chart and its web view are now vertically `Ignored` so the layout
+uses the 200/480px minimum instead. At 1366×768 the tabs are now
+262px tall (viewport 229px) with the Institutions cards visible and
+scrolling. No data, scoring, or setup logic changed — layout and
+chart sizing only.
 
 v0.7.0 is the chart preview + tabs + settings + light theme. The
 dashboard chart is now a small ~240px preview: the "⛶ Expand chart"

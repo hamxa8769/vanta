@@ -81,7 +81,7 @@ def test_tabs_exist_with_right_panels(tmp_path, monkeypatch, qapp,
     # The strip and the chart preview stay above the tabs.
     assert window._strip_widget.isVisible()
     assert window._price_box.isVisible()
-    assert window._tv_chart.minimumHeight() == 240
+    assert window._tv_chart.minimumHeight() == 200
     window.close()
 
 
@@ -114,7 +114,7 @@ def test_expand_button_opens_centred_modeless_dialog(
     dialog.close()
     qapp.processEvents()
     assert window._chart_dialog is None
-    assert chart.minimumHeight() == 240
+    assert chart.minimumHeight() == 200
     assert not window._chart_placeholder.isVisible()
     assert window._price_layout.indexOf(window._chart_container) >= 0
     window.close()

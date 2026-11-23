@@ -150,17 +150,17 @@ def test_strip_updates_from_payload(tmp_path, monkeypatch, qapp):
 
 def test_chart_preview_is_small_and_expands_tall(
         tmp_path, monkeypatch, qapp):
-    """v0.7.0: the dashboard chart is a ~240px preview; expanding it
+    """v0.7.0: the dashboard chart is a ~200px preview; expanding it
     (button or click) moves the SAME widget into a centred dialog
     where it is 480px tall; closing the dialog docks it back."""
     window = _open_window(tmp_path, monkeypatch, qapp)
     price_panel = next(p for p in window._panels if p["key"] == "price")
     assert price_panel["wide"] is True
     # Preview: small, both pages.
-    assert window._tv_chart.minimumHeight() == 240
-    assert window._price_chart.minimumHeight() == 240
+    assert window._tv_chart.minimumHeight() == 200
+    assert window._price_chart.minimumHeight() == 200
     if window._tv_chart._view is not None:
-        assert window._tv_chart._view.minimumHeight() == 240
+        assert window._tv_chart._view.minimumHeight() == 200
     window.close()
 
 

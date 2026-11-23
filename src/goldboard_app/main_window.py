@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStatusBar,
     QSystemTrayIcon,
@@ -883,6 +884,7 @@ class MainWindow(QMainWindow):
         QPushButton.ghost:checked {{ background: {PALETTE["hover_bg"]}; }}
         QPushButton.gold {{ background: {PALETTE["gold"]}; color: {PALETTE["black"]};
             border: none; }}
+        QPushButton[compact="true"] {{ padding: 3px 10px; font-size: 12px; }}
         QMenu {{ background: {PALETTE["surface"]}; color: {PALETTE["text"]};
             border: 1px solid {PALETTE["gold"]}; border-radius: 6px; padding: 4px; }}
         QMenu::item:selected {{ background: {PALETTE["hover_bg"]}; }}
@@ -895,7 +897,7 @@ class MainWindow(QMainWindow):
         QTabBar::tab {{ background: {PALETTE["surface"]}; color: {PALETTE["muted"]};
             border: 1px solid {PALETTE["border"]}; border-bottom: none;
             border-top-left-radius: 8px; border-top-right-radius: 8px;
-            padding: 8px 18px; font-weight: bold; }}
+            padding: 5px 14px; font-weight: bold; }}
         QTabBar::tab:selected {{ background: {PALETTE["black"]};
             color: {PALETTE["gold"]}; border-bottom: 2px solid {PALETTE["gold"]}; }}
         QTabBar::tab:hover {{ color: {PALETTE["text"]}; }}
@@ -971,6 +973,11 @@ class MainWindow(QMainWindow):
     def _build_header(self) -> None:
         header = QWidget(self)
         layout = QHBoxLayout(header)
+        # Compact header (v0.7.1): the 66px header + 115px strip left
+        # the tabs ~85px tall on a 1366x768 screen. Smaller logo,
+        # tighter margins and compact buttons buy the tabs ~20px.
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
         logo_path = resource_path("assets/logo/vanta-logo.png")
         if not logo_path.is_file():
             from goldboard_core.branding import get_app_logo_path
@@ -978,13 +985,13 @@ class MainWindow(QMainWindow):
         # Logo in a visible tile: the PNG is a gold ring on black, so
         # on the near-black header it was invisible without a border.
         logo = QLabel(header)
-        logo.setFixedSize(48, 48)
+        logo.setFixedSize(36, 36)
         logo.setStyleSheet(
             f"border: 1px solid {PALETTE['gold']}; border-radius: 10px; "
             "background-color: #0a0a0a; padding: 2px;")
         if logo_path is not None and Path(logo_path).is_file():
             pix = QPixmap(str(logo_path)).scaled(
-                42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo.setPixmap(pix)
         else:
             logo.setText("◆")
@@ -1010,12 +1017,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._clock_label)
         self._settings_button = QPushButton("Settings", header)
         self._settings_button.setProperty("class", "ghost")
+        self._settings_button.setProperty("compact", True)
         self._settings_button.clicked.connect(self._show_settings_tab)
         layout.addWidget(self._settings_button)
         # Theme toggle (v0.7.0): header button + the same toggle in
         # the Settings tab. Persisted in QSettings ("theme").
         self._theme_button = QPushButton(header)
         self._theme_button.setProperty("class", "ghost")
+        self._theme_button.setProperty("compact", True)
         self._theme_button.setCheckable(True)
         self._theme_button.clicked.connect(self._toggle_theme)
         layout.addWidget(self._theme_button)
@@ -1026,10 +1035,12 @@ class MainWindow(QMainWindow):
         # at all. Clicking it with no pending update re-checks.
         self._update_button = QPushButton("Check for updates", header)
         self._update_button.setProperty("class", "ghost")
+        self._update_button.setProperty("compact", True)
         self._update_button.clicked.connect(self._on_update_button)
         layout.addWidget(self._update_button)
         self._panels_button = QPushButton("Panels ▾", header)
         self._panels_button.setProperty("class", "ghost")
+        self._panels_button.setProperty("compact", True)
         self._panels_menu = QMenu(self)
         self._panels_button.setMenu(self._panels_menu)
         layout.addWidget(self._panels_button)
@@ -1044,6 +1055,7 @@ class MainWindow(QMainWindow):
         self._interval_spin.valueChanged.connect(self._on_interval_changed)
         layout.addWidget(self._interval_spin)
         self._refresh_button = QPushButton("Refresh", header)
+        self._refresh_button.setProperty("compact", True)
         self._refresh_button.clicked.connect(self.start_refresh)
         layout.addWidget(self._refresh_button)
         self._header = header
@@ -1157,6 +1169,17 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda checked=False, k=key: self._toggle_panel(k, checked))
             self._panels_menu.addAction(action)
+        # Logs drawer (v0.7.1): hidden by default to give the tabs
+        # room; the menu is how it comes back. Guarded: the menu is
+        # also built before the dock exists.
+        if hasattr(self, "_log_dock"):
+            self._panels_menu.addSeparator()
+            logs_action = QAction("Logs", self)
+            logs_action.setCheckable(True)
+            logs_action.setChecked(self._log_dock.isVisible())
+            logs_action.triggered.connect(
+                lambda checked=False: self._toggle_logs(checked))
+            self._panels_menu.addAction(logs_action)
 
     def _toggle_panel(self, key: str, visible: bool) -> None:
         for panel in self._panels:
@@ -1378,27 +1401,48 @@ class MainWindow(QMainWindow):
         box, layout = self._panel("Gold price (XAUUSD) — LIVE · TradingView")
         self._price_box = box
         self._price_layout = layout
+        # Tighter box chrome for the hero panel only (v0.7.1): the
+        # global QGroupBox padding (16px) + margin-top (14px) cost
+        # ~46px the tabs below need on a 1366x768 screen. Border,
+        # radius and background still come from the global rule.
+        box.setStyleSheet("QGroupBox { padding: 8px; margin-top: 12px; }")
+        # Compact price panel (v0.7.1): at 1366x768 the old panel
+        # (price / change / source / expand row / 240px chart /
+        # status row / range row) was ~530px tall and left the tabs
+        # ~85px with no way to scroll to them. Now price + change +
+        # Expand share one row, the source is one short line, and
+        # status + Retry + range buttons share one row that travels
+        # with the chart into the expand dialog.
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(2)
         self._price_value = QLabel("—", content)
         self._price_value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._price_value.setFont(_font(30, bold=True))
         self._price_value.setStyleSheet(f"color: {PALETTE['gold_light']};")
         self._price_change = QLabel("—", content)
         self._price_change.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._price_source = QLabel("No data yet.", content)
-        self._price_source.setProperty("class", "muted")
-        self._price_source.setWordWrap(True)
-        self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        # Expand affordance: a button in the panel header row, and a
-        # click on the chart area itself (see eventFilter).
-        expand_row = QHBoxLayout()
-        expand_row.addStretch(1)
-        self._expand_button = QPushButton("⛶ Expand chart", content)
+        # Expand affordance: a button in the price row, and a click
+        # on the chart area itself (see eventFilter). No ⛶ glyph in
+        # the label (v0.7.1): the symbol falls back to a tall symbol
+        # font and inflates the button (and the whole price row)
+        # from 25px to 33px. The dialog's Collapse button keeps its
+        # glyph — height is free there.
+        price_row = QHBoxLayout()
+        price_row.addWidget(self._price_value)
+        price_row.addWidget(self._price_change)
+        price_row.addStretch(1)
+        self._expand_button = QPushButton("Expand chart", content)
         self._expand_button.setProperty("class", "ghost")
+        self._expand_button.setProperty("compact", True)
         self._expand_button.setToolTip(
             "Open the chart large in a centred window "
             "(or click the chart itself)")
         self._expand_button.clicked.connect(self._expand_chart)
-        expand_row.addWidget(self._expand_button)
+        price_row.addWidget(self._expand_button)
+        self._price_source = QLabel("No data yet.", content)
+        self._price_source.setProperty("class", "muted")
+        self._price_source.setWordWrap(False)
+        self._price_source.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         # Real TradingView candlestick chart; the built-in chart is the
         # fallback when TradingView cannot load (offline / blocked).
         # The chart + status + retry + range buttons live in one
@@ -1408,35 +1452,43 @@ class MainWindow(QMainWindow):
                                           theme=self._theme)
         self._tv_chart.set_min_height(PREVIEW_MIN_HEIGHT)
         self._tv_chart.status_changed.connect(self._update_chart_status)
-        chart_status_row = QHBoxLayout()
+        merged_row = QHBoxLayout()
         self._chart_status = QLabel(
             "TradingView loading…", content)
-        self._chart_status.setWordWrap(True)
+        self._chart_status.setWordWrap(False)
+        # Horizontally Ignored (v0.7.1): the fallback status text is
+        # ~500px wide; with a normal policy the merged row's minimum
+        # width forced the expand dialog wider than its 760px
+        # geometry on an 800px screen (dialog came out 801px and
+        # off-centre). The label may elide in a narrow dialog; the
+        # buttons must never be pushed out.
+        self._chart_status.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._chart_retry_button = QPushButton(
             "Retry TradingView", content)
         self._chart_retry_button.setProperty("class", "ghost")
+        self._chart_retry_button.setProperty("compact", True)
         self._chart_retry_button.clicked.connect(
             self._on_retry_tradingview)
-        chart_status_row.addWidget(self._chart_status, 1)
-        chart_status_row.addWidget(self._chart_retry_button)
-        range_row = QHBoxLayout()
+        merged_row.addWidget(self._chart_status, 1)
+        merged_row.addWidget(self._chart_retry_button)
         self._range_buttons: dict[str, QPushButton] = {}
         for label in ("1D", "5D", "1M", "1Y", "2Y"):
             btn = QPushButton(label, content)
             btn.setProperty("class", "ghost")
+            btn.setProperty("compact", True)
             btn.setCheckable(True)
             btn.setChecked(label == self._chart_range)
             btn.clicked.connect(
                 lambda _checked=False, r=label: self._set_chart_range(r))
             self._range_buttons[label] = btn
-            range_row.addWidget(btn)
-        range_row.addStretch(1)
+            merged_row.addWidget(btn)
         self._chart_container = QWidget(content)
         container_layout = QVBoxLayout(self._chart_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(4)
         container_layout.addWidget(self._tv_chart)
-        container_layout.addLayout(chart_status_row)
-        container_layout.addLayout(range_row)
+        container_layout.addLayout(merged_row)
         # Placeholder shown in the preview while the chart is expanded.
         self._chart_placeholder = QWidget(content)
         ph_layout = QHBoxLayout(self._chart_placeholder)
@@ -1448,10 +1500,8 @@ class MainWindow(QMainWindow):
         ph_layout.addWidget(ph_label, 1)
         ph_layout.addWidget(self._restore_button)
         self._chart_placeholder.setVisible(False)
-        layout.addWidget(self._price_value)
-        layout.addWidget(self._price_change)
+        layout.addLayout(price_row)
         layout.addWidget(self._price_source)
-        layout.addLayout(expand_row)
         layout.addWidget(self._chart_container)
         layout.addWidget(self._chart_placeholder)
         layout.addStretch(1)
@@ -1690,6 +1740,7 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self._price_box)
         central_layout.addWidget(self._tabs, 1)
         central_layout.setContentsMargins(8, 4, 8, 4)
+        central_layout.setSpacing(2)
         self.setCentralWidget(central)
 
     def _build_log_drawer(self) -> None:
@@ -1704,6 +1755,27 @@ class MainWindow(QMainWindow):
         # Keep the log drawer slim by default so all ten panels stay
         # visible; the user can drag it taller or close it.
         self.resizeDocks([dock], [130], Qt.Vertical)
+        # Hidden by default (v0.7.1): the 130px drawer plus a ~530px
+        # price panel left the tabs ~85px tall on a 1366x768 screen.
+        # The Panels menu has a "Logs" toggle to bring it back.
+        dock.setVisible(
+            self.settings.value("logs_visible", False, type=bool))
+        dock.visibilityChanged.connect(self._on_log_dock_visibility)
+        self._build_panels_menu()
+
+    def _on_log_dock_visibility(self, visible: bool) -> None:
+        """Dock closed (X) or shown: remember it + refresh the menu.
+
+        The Panels menu's Logs action reads isVisible() at build
+        time, so rebuild it to keep the checkmark honest.
+        """
+        self.settings.setValue("logs_visible", bool(visible))
+        self._build_panels_menu()
+
+    def _toggle_logs(self, visible: bool) -> None:
+        """Panels-menu Logs action: show/hide the log drawer."""
+        self.settings.setValue("logs_visible", bool(visible))
+        self._log_dock.setVisible(bool(visible))
 
     # ------------------------------------------------------------------ clock
 
@@ -1849,10 +1921,12 @@ class MainWindow(QMainWindow):
                 f"color: {STATUS_COLORS['ok']};")
             self._chart_retry_button.setVisible(False)
         else:
+            # Short on purpose (v0.7.1): the status shares one row
+            # with Retry + the range buttons now, so it must fit on
+            # a single line instead of wrapping to two.
             self._chart_status.setText(
-                "Built-in chart — TradingView could not load "
-                "(network blocked?). The built-in chart below is live "
-                "data from stored bars.")
+                "Built-in chart — TradingView could not load. "
+                "Live data from stored bars.")
             self._chart_status.setStyleSheet(
                 f"color: {STATUS_COLORS['stale']};")
             self._chart_retry_button.setVisible(True)
@@ -1913,6 +1987,10 @@ class MainWindow(QMainWindow):
         self._expand_button.setEnabled(False)
         self._chart_dialog = dialog
         dialog.show()
+        # The chart just moved into a bigger viewport: force the
+        # TradingView widget to re-measure (v0.7.1) once the dialog
+        # has laid out, otherwise it keeps its preview-sized iframe.
+        QTimer.singleShot(100, self._tv_chart.refresh_size)
         self.log("Chart expanded to a centred window.")
 
     def _on_chart_dialog_closed(self) -> None:

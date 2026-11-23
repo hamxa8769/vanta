@@ -1,10 +1,10 @@
-"""Frozen e2e check for v0.7.0 (NOT a pytest test).
+"""Frozen e2e check for v0.7.1 (NOT a pytest test).
 
 Launches the frozen dist/Vanta/Vanta binary headless (offscreen)
 with an isolated HOME for ~180s, then inspects the DB it wrote:
 price bars (daily + intraday), snapshots per source, and recomputes
 the technical summary + setups + volume profile from the stored
-real bars to prove the new v0.7.0 panels have real data behind them.
+real bars to prove the new v0.7.1 panels have real data behind them.
 
 Usage: python scripts/e2e_frozen.py [seconds]
 """

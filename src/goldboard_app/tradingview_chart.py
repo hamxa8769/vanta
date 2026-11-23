@@ -21,8 +21,10 @@ PriceChart) and lives on the second page of a QStackedWidget.
 
 from __future__ import annotations
 
+import json
+
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QLabel, QStackedWidget, QWidget
+from PySide6.QtWidgets import QLabel, QSizePolicy, QStackedWidget, QWidget
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -38,15 +40,33 @@ def _widget_html(theme: str = "dark") -> str:
     Dark matches the board's black + gold; light is TradingView's
     own light theme (white background) so the chart never looks
     like a dark hole inside a light dashboard.
+
+    Sizing (v0.7.1 — this was the collapsed-chart bug): the embed
+    script sets the widget container's height to the settings'
+    ``"height": "100%"`` and the iframe to ``height: 100%`` of it,
+    but it never listens for resize and never re-measures. A
+    percentage height only resolves when every ancestor has a
+    definite height — the old HTML set no height on ``html`` /
+    ``body``, so the whole chain collapsed and the iframe fell back
+    to the HTML default of 150px, however tall the QWebEngineView
+    was. With ``html, body`` at ``height: 100%`` the container and
+    the iframe resolve against the viewport and track resizes in
+    pure CSS (``refresh_size`` below is the belt-and-braces for
+    reparenting). ``100vh``/``100vw`` are deliberately NOT used:
+    the script overwrites the container height with ``100%``
+    anyway, and ``100vw`` can overflow horizontally.
     """
     light = theme == "light"
     bg = "#ffffff" if light else "#131722"
     bg_rgba = "rgba(255, 255, 255, 1)" if light else "rgba(19, 23, 34, 1)"
     grid = "rgba(46, 46, 46, 0.12)" if light else "rgba(46, 46, 46, 0.06)"
     tv_theme = "light" if light else "dark"
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;background:{bg};">
-<div class="tradingview-widget-container" style="height:100vh;width:100vw;">
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{{height:100%;margin:0;padding:0;overflow:hidden;background:{bg};}}
+.tradingview-widget-container{{height:100%;width:100%;}}
+</style></head>
+<body>
+<div class="tradingview-widget-container">
 <div id="tv_chart" style="height:100%;width:100%;"></div>
 <script src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
 {{"symbol": "OANDA:XAUUSD", "theme": "{tv_theme}", "interval": "D",
@@ -67,9 +87,40 @@ WATCHDOG_SECONDS = 20
 # failed to load the whole panel collapsed and the chart looked
 # invisible. The stacked widget itself gets the same minimum so the
 # panel never shrinks. The dashboard preview is smaller — see
-# PREVIEW_MIN_HEIGHT and set_min_height().
+# PREVIEW_MIN_HEIGHT and set_min_height(). v0.7.1: preview 200px
+# (was 240) so the tab content below gets real room on a 1366x768
+# screen.
 CHART_MIN_HEIGHT = 480
-PREVIEW_MIN_HEIGHT = 240
+PREVIEW_MIN_HEIGHT = 200
+
+# JS run by refresh_size(): force the widget container and its
+# iframe to the current viewport height in pixels, then dispatch a
+# resize event. The embed script never re-measures on its own (no
+# resize listener, no clientHeight reads — verified against the
+# script served by s3.tradingview.com), so this is what makes the
+# chart actually fill the view after a resize or a reparent into
+# the expand dialog. Non-iframe children (e.g. the 32px copyright
+# bar, when present) are subtracted so the iframe never overflows.
+_RESIZE_JS = """(function(){
+  var c = document.querySelector('.tradingview-widget-container');
+  if (!c) return JSON.stringify({ok:false,reason:'no-container'});
+  var h = window.innerHeight || document.documentElement.clientHeight || 0;
+  c.style.height = h + 'px'; c.style.width = '100%';
+  var other = 0;
+  for (var i = 0; i < c.children.length; i++) {
+    var el = c.children[i];
+    if (el.tagName !== 'IFRAME') other += el.offsetHeight || 0;
+  }
+  var f = c.querySelector('iframe');
+  var ih = 0;
+  if (f) {
+    f.style.height = Math.max(0, h - other) + 'px';
+    f.style.width = '100%';
+    ih = f.clientHeight;
+  }
+  window.dispatchEvent(new Event('resize'));
+  return JSON.stringify({ok:true, viewport:h, iframe:ih});
+})()"""
 
 
 class TradingViewChart(QStackedWidget):
@@ -89,6 +140,15 @@ class TradingViewChart(QStackedWidget):
                  html: str | None = None, theme: str = "dark") -> None:
         super().__init__(parent)
         self.setMinimumHeight(CHART_MIN_HEIGHT)
+        # v0.7.1: a QWebEngineView reports an 800x600 sizeHint. With
+        # a normal policy the dashboard layout hands the price panel
+        # ~600px and squeezes the tabs to ~100px at 1366x768 — the
+        # tabs were cut off on the user's screen even after the
+        # panel was compacted, because the web view's sizeHint, not
+        # the panel chrome, was eating the space. Ignored vertically:
+        # layouts use the 200/480px minimum instead, and the chart
+        # still expands to fill whatever the panel gives it.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         self._fallback = fallback
         self._fallback.setMinimumHeight(CHART_MIN_HEIGHT)
         self._live = False
@@ -96,9 +156,16 @@ class TradingViewChart(QStackedWidget):
         self._theme = theme if theme in ("dark", "light") else "dark"
         self._html = html if html is not None else _widget_html(self._theme)
         self._view = None
+        # refresh_size() bookkeeping (v0.7.1): one probe-triggered
+        # reload per page load at most, and a debounced resize hook.
+        self._probe_reloaded = False
+        self._resize_pending = False
+        self._shown_once = False
         if WEBENGINE_AVAILABLE:
             self._view = QWebEngineView(self)
             self._view.setMinimumHeight(CHART_MIN_HEIGHT)
+            self._view.setSizePolicy(
+                QSizePolicy.Expanding, QSizePolicy.Ignored)
             self.addWidget(self._view)
             self.addWidget(self._fallback)
             self.setCurrentIndex(0)
@@ -132,6 +199,8 @@ class TradingViewChart(QStackedWidget):
             return
         self._theme = theme
         self._html = _widget_html(theme)
+        # New page load: a probe-triggered reload is allowed again.
+        self._probe_reloaded = False
         self.reload()
 
     def set_min_height(self, height: int) -> None:
@@ -170,6 +239,61 @@ class TradingViewChart(QStackedWidget):
         if hasattr(self, "_watchdog"):
             self._watchdog.start()
 
+    def refresh_size(self) -> None:
+        """Force the TradingView widget to fill the current view.
+
+        Runs _RESIZE_JS in the page: the widget container and its
+        iframe get the viewport height in pixels, and a resize event
+        is dispatched. No-op without a web view, or while the view
+        is still (near) zero-sized — sizing a 0px viewport would
+        collapse the chart to nothing. Called debounced from
+        resizeEvent, once on first show, when the iframe first goes
+        live, and after reparenting into the expand dialog.
+        """
+        if self._view is None or self.height() < 50:
+            return
+        self._view.page().runJavaScript(
+            _RESIZE_JS, self._on_refresh_size_result)
+
+    def _on_refresh_size_result(self, result) -> None:
+        """Probe after refresh_size(): if the iframe is still far
+        below the viewport, reload the HTML at the current size.
+
+        At most one probe-triggered reload per page load — reload()
+        is the last resort, not a loop. A fresh load at the right
+        size (with the fixed html/body heights) fills the view.
+        """
+        try:
+            data = json.loads(result) if isinstance(result, str) else {}
+        except (TypeError, ValueError):
+            return
+        if not isinstance(data, dict) or not data.get("ok"):
+            return
+        viewport = data.get("viewport") or 0
+        iframe = data.get("iframe") or 0
+        if (viewport > 100 and iframe < 0.8 * viewport
+                and not self._probe_reloaded):
+            self._probe_reloaded = True
+            self.reload()
+
+    def resizeEvent(self, event) -> None:  # noqa: D102 — Qt hook
+        super().resizeEvent(event)
+        if self._view is None or self._resize_pending:
+            return
+        self._resize_pending = True
+        QTimer.singleShot(150, self._on_resize_debounced)
+
+    def _on_resize_debounced(self) -> None:
+        self._resize_pending = False
+        self.refresh_size()
+
+    def showEvent(self, event) -> None:  # noqa: D102 — Qt hook
+        super().showEvent(event)
+        if self._shown_once:
+            return
+        self._shown_once = True
+        QTimer.singleShot(100, self.refresh_size)
+
     def show_fallback(self) -> None:
         """Switch to the built-in chart (and stop the watchdog)."""
         was_on_tv = self.currentIndex() == 0
@@ -202,6 +326,9 @@ class TradingViewChart(QStackedWidget):
             if not self._live:
                 self._live = True
                 self.status_changed.emit(True)
+                # The iframe just appeared — force it to fill the
+                # view now, not at whatever size it first measured.
+                self.refresh_size()
             if hasattr(self, "_watchdog"):
                 self._watchdog.stop()
         elif self._elapsed >= WATCHDOG_SECONDS:
