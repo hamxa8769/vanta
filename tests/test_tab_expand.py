@@ -54,9 +54,16 @@ def test_expand_button_opens_centred_modeless_tab_dialog(
     assert scroll.isVisible()
     assert scroll.geometry().height() > 200
     assert window._tabs.indexOf(scroll) < 0
-    # Centred within the screen's available geometry.
+    # Centred within the screen's available geometry. Exact-pixel
+    # equality is not achievable on every platform: when the dialog
+    # is as wide as the screen, its window frame hangs off the edge
+    # and the platform nudges it ~2px (verified locally), so allow
+    # a 5px tolerance — it still catches real mis-centring (the
+    # original bug was 38px, the first fix attempt 20px).
     screen = QApplication.primaryScreen().availableGeometry()
-    assert dialog.geometry().center() == screen.center()
+    centre = dialog.geometry().center()
+    assert abs(centre.x() - screen.center().x()) <= 5
+    assert abs(centre.y() - screen.center().y()) <= 5
     # Closing the dialog docks the page back, same position.
     dialog.close()
     qapp.processEvents()

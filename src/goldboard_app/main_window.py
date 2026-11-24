@@ -2420,6 +2420,26 @@ class MainWindow(QMainWindow):
                     return True
         return super().eventFilter(watched, event)
 
+    def _centre_dialog(self, dialog) -> None:
+        """Move an expand dialog so its centre is the screen centre.
+
+        The dialog's size is only final once it is shown: Qt enforces
+        the layout minimum synchronously inside show() and grows the
+        dialog while keeping its top-left (verified locally: a 759px
+        dialog grew to 806px inside show() itself), so a dialog sized
+        from a pre-show estimate lands off-centre on a small screen
+        (Windows CI: 20px right). Centre it again from its actual
+        shown size, right after show() returns — no timer, the
+        geometry is already final at that point. Use setGeometry,
+        not move(): move() positions the window FRAME, so the client
+        rect lands 2px right/down of where it was asked to go.
+        """
+        screen = QApplication.primaryScreen().availableGeometry()
+        geo = dialog.geometry()
+        x = screen.x() + (screen.width() - geo.width()) // 2
+        y = screen.y() + (screen.height() - geo.height()) // 2
+        dialog.setGeometry(x, y, geo.width(), geo.height())
+
     def _expand_chart(self) -> None:
         """Move the chart container into a centred modeless dialog."""
         if self._chart_dialog is not None:
@@ -2461,6 +2481,8 @@ class MainWindow(QMainWindow):
         self._expand_button.setEnabled(False)
         self._chart_dialog = dialog
         dialog.show()
+        # Centre from the ACTUAL shown size (see _centre_dialog).
+        self._centre_dialog(dialog)
         # The chart just moved into a bigger viewport: force the
         # TradingView widget to re-measure (v0.7.1) once the dialog
         # has laid out, otherwise it keeps its preview-sized iframe.
@@ -2549,6 +2571,8 @@ class MainWindow(QMainWindow):
         self._expand_tab_button.setEnabled(False)
         self._tab_dialog = dialog
         dialog.show()
+        # Centre from the ACTUAL shown size (see _centre_dialog).
+        self._centre_dialog(dialog)
         self.log(f"Tab '{title}' expanded to a centred window.")
 
     def _on_tab_dialog_closed(self) -> None:

@@ -105,9 +105,16 @@ def test_expand_button_opens_centred_modeless_dialog(
     assert dialog.chart_layout.indexOf(window._chart_container) >= 0
     assert window._chart_container.isVisible()
     assert window._chart_container.geometry().height() > 200
-    # Centred within the screen's available geometry.
+    # Centred within the screen's available geometry. Exact-pixel
+    # equality is not achievable on every platform: when the dialog
+    # is as wide as the screen, its window frame hangs off the edge
+    # and the platform nudges it ~2px (verified locally), so allow
+    # a 5px tolerance — it still catches real mis-centring (the
+    # original bug was 38px, the first fix attempt 20px).
     screen = QApplication.primaryScreen().availableGeometry()
-    assert dialog.geometry().center() == screen.center()
+    centre = dialog.geometry().center()
+    assert abs(centre.x() - screen.center().x()) <= 5
+    assert abs(centre.y() - screen.center().y()) <= 5
     # Big in the dialog.
     assert chart.minimumHeight() >= 480
     assert window._chart_placeholder.isVisible()
