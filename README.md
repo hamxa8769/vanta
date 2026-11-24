@@ -168,8 +168,39 @@ Gates never fake a pass: with no data, G0–G4 fail and G7 reports
 ## Versioning
 
 `VERSION` file + `goldboard_core.__version__` + `pyproject.toml` all
-carry the same version. Current: **0.7.1**. Every release bumps the
+carry the same version. Current: **0.8.0**. Every release bumps the
 patch version and gets a tag (same standing rule as the other apps).
+
+v0.8.0 fixes the blank chart the user reported on his Windows
+machine with v0.7.1 (white area, status "TradingView LIVE") and
+adds the tab expand + signal markers he asked for. (1) The blank
+chart: `refresh_size()` subtracted the offsetHeight of EVERY
+non-iframe child of the widget container — but the container's
+children are the empty `#tv_chart` wrapper div (`height:100%`, so
+~viewport tall) plus the script/style tags, so the iframe got
+`max(0, h - h) = 0px` the moment it appeared. Only the 32px
+copyright bar (when present) is subtracted now, and the watchdog
+verifies the iframe RENDERS tall (>50% of the viewport) before
+calling it live — a 0px iframe falls back to the built-in chart
+instead of showing a blank box that claims to be live. (2) Tabs
+expand: an "Expand tab" button in the tab bar's corner, or a
+double-click on a tab, opens that tab large in a centred modeless
+dialog holding the SAME scroll area; closing it docks the page
+back. (3) The strip's Technical card now shows the LATEST
+advisory signal (BUY/SELL pill + entry + time + confidence, or an
+honest NO SIGNAL when the score is inside the ±40 band), and the
+Active Setups card prefers a directional setup over the event
+caution (which used to read "· NONE"). (4) Signal markers: the
+TradingView embed is a cross-origin iframe with NO marker/drawing
+API (verified against the embed script), so Vanta's signals are
+plotted on the built-in chart instead — a "TradingView | Vanta
+signals" switcher in the chart's control row flips the view, and
+the expanded dialog carries it. Each marker sits on its signal's
+bar at its entry price, with dashed entry / SL (red) / TP (green)
+lines and the outcome (TP hit / SL hit / expired, with the R
+multiple) from the existing backtest engine; a signal too recent
+to evaluate stays "open". No data, scoring, signal, or setup logic
+changed — display only.
 
 v0.7.1 fixes the two layout bugs the user reported on his Windows
 machine with v0.7.0 screenshots. (1) The live TradingView chart

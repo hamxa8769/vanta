@@ -13,7 +13,9 @@ gracefully instead of breaking:
     A watchdog waits up to 20s for the widget's iframe to appear;
     if it never does (offline, or a network that blocks
     tradingview.com), the built-in chart takes over and the log says
-    so. Nothing is ever a blank panel.
+    so. Nothing is ever a blank panel. (v0.8.0: the watchdog also
+    verifies the iframe RENDERS tall — an iframe that exists but is
+    ~0px tall used to count as live and show a blank white box.)
 
 The fallback widget is supplied by the caller (the existing
 PriceChart) and lives on the second page of a QStackedWidget.
@@ -99,18 +101,31 @@ PREVIEW_MIN_HEIGHT = 200
 # resize listener, no clientHeight reads — verified against the
 # script served by s3.tradingview.com), so this is what makes the
 # chart actually fill the view after a resize or a reparent into
-# the expand dialog. Non-iframe children (e.g. the 32px copyright
-# bar, when present) are subtracted so the iframe never overflows.
+# the expand dialog.
+#
+# v0.8.0 — this JS was the blank-chart bug (v0.7.1): it subtracted
+# the offsetHeight of EVERY non-iframe child of the container. The
+# container's children are the #tv_chart wrapper DIV (empty — the
+# embed script appends the iframe as a direct child of the
+# container, not inside the wrapper) with height:100%, the <script>
+# tag, and the injected <style> tag. So "other" was ~= the viewport
+# height and the iframe got max(0, h - h) = 0px — the chart was
+# actively zeroed the moment the iframe appeared, while the status
+# stayed "LIVE" because the iframe existed. Now only the
+# .tradingview-widget-copyright bar (32px, present only when the
+# markup carries a copyright element — ours does not, so the
+# subtraction is 0) is ever subtracted; the wrapper div is never
+# subtracted. An iframe that renders ~0px is not live — see
+# _VISIBILITY_JS and _iframe_visibly_live() below.
 _RESIZE_JS = """(function(){
   var c = document.querySelector('.tradingview-widget-container');
   if (!c) return JSON.stringify({ok:false,reason:'no-container'});
   var h = window.innerHeight || document.documentElement.clientHeight || 0;
   c.style.height = h + 'px'; c.style.width = '100%';
-  var other = 0;
-  for (var i = 0; i < c.children.length; i++) {
-    var el = c.children[i];
-    if (el.tagName !== 'IFRAME') other += el.offsetHeight || 0;
-  }
+  var w = document.getElementById('tv_chart');
+  if (w) { w.style.height = h + 'px'; w.style.width = '100%'; }
+  var copy = c.querySelector('.tradingview-widget-copyright');
+  var other = copy ? (copy.offsetHeight || 0) : 0;
   var f = c.querySelector('iframe');
   var ih = 0;
   if (f) {
@@ -121,6 +136,33 @@ _RESIZE_JS = """(function(){
   window.dispatchEvent(new Event('resize'));
   return JSON.stringify({ok:true, viewport:h, iframe:ih});
 })()"""
+
+# JS run by the watchdog to check the iframe is VISIBLY live: an
+# iframe that exists but renders ~0px tall (a sizing bug) must never
+# count as live — the built-in chart is always preferable to a
+# blank white box. Returns {iframe, viewport} in CSS pixels.
+_VISIBILITY_JS = """(function(){
+  var f = document.querySelector('iframe');
+  var h = window.innerHeight || document.documentElement.clientHeight || 0;
+  return JSON.stringify({iframe: f ? (f.clientHeight || 0) : 0,
+                         viewport: h});
+})()"""
+
+
+def _iframe_visibly_live(viewport: float, iframe: float) -> bool:
+    """True when the iframe renders a real fraction of the view.
+
+    Existence is not liveness: a 0px iframe (sizing bug) must fall
+    back, not show a blank box. The bar is >50% of the viewport so
+    a half-rendered widget still counts, but a collapsed one never
+    does. Pure function — unit-tested directly.
+    """
+    try:
+        viewport = float(viewport or 0)
+        iframe = float(iframe or 0)
+    except (TypeError, ValueError):
+        return False
+    return viewport > 100 and iframe > 0.5 * viewport
 
 
 class TradingViewChart(QStackedWidget):
@@ -161,6 +203,9 @@ class TradingViewChart(QStackedWidget):
         self._probe_reloaded = False
         self._resize_pending = False
         self._shown_once = False
+        # Visibility probe (v0.8.0): one in flight at a time — the
+        # watchdog ticks every second and must not stack probes.
+        self._visibility_pending = False
         if WEBENGINE_AVAILABLE:
             self._view = QWebEngineView(self)
             self._view.setMinimumHeight(CHART_MIN_HEIGHT)
@@ -184,7 +229,8 @@ class TradingViewChart(QStackedWidget):
 
     @property
     def is_live(self) -> bool:
-        """True once the TradingView iframe has appeared."""
+        """True once the TradingView iframe is visibly live (renders
+        a real fraction of the view — existence alone is not live)."""
         return self._live
 
     def set_theme(self, theme: str) -> None:
@@ -230,6 +276,7 @@ class TradingViewChart(QStackedWidget):
         """
         self._live = False
         self._elapsed = 0
+        self._visibility_pending = False
         if self._view is None:
             self.show_fallback()
             return
@@ -323,13 +370,48 @@ class TradingViewChart(QStackedWidget):
         except (TypeError, ValueError):
             found = False
         if found:
+            # v0.8.0: existence is NOT liveness. An iframe that
+            # renders ~0px (a sizing bug) used to count as live and
+            # show a blank white box. Now the visibility probe must
+            # confirm a real rendered height first; until then the
+            # watchdog keeps ticking (and refresh_size() keeps
+            # trying to fix the size) instead of declaring live.
+            if self._live:
+                return
+            if not self._visibility_pending:
+                self._visibility_pending = True
+                self._view.page().runJavaScript(
+                    _VISIBILITY_JS, self._on_visibility_result)
+            return
+        if self._elapsed >= WATCHDOG_SECONDS:
+            self.show_fallback()
+
+    def _on_visibility_result(self, result) -> None:
+        """Watchdog visibility probe: only a visibly-tall iframe is
+        live. Too short -> try to fix the size and keep waiting;
+        still short when the watchdog expires -> fall back to the
+        built-in chart (never a blank box)."""
+        self._visibility_pending = False
+        try:
+            data = json.loads(result) if isinstance(result, str) else {}
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if _iframe_visibly_live(data.get("viewport") or 0,
+                                data.get("iframe") or 0):
             if not self._live:
                 self._live = True
                 self.status_changed.emit(True)
-                # The iframe just appeared — force it to fill the
-                # view now, not at whatever size it first measured.
+                # The iframe just went visibly live — force it to
+                # fill the view now, not at whatever size it first
+                # measured.
                 self.refresh_size()
             if hasattr(self, "_watchdog"):
                 self._watchdog.stop()
-        elif self._elapsed >= WATCHDOG_SECONDS:
+            return
+        # Found but not visibly live: try to fix the size, keep
+        # waiting for the watchdog to expire.
+        self.refresh_size()
+        if self._elapsed >= WATCHDOG_SECONDS:
             self.show_fallback()

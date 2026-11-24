@@ -16,7 +16,7 @@ shows FAILED/STALE — never an invented value. No live trading anywhere.
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QSystemTrayIcon,
     QTabWidget,
@@ -68,6 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from goldboard_core.backtest import backtest
 from goldboard_core.branding import (
     APP_DISPLAY_NAME,
     LOGO_DIR,
@@ -134,6 +136,21 @@ def _fmt_time(value: datetime | str | None) -> str:
     if isinstance(value, str):
         return value[:19].replace("T", " ")
     return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _as_aware(value) -> datetime | None:
+    """A datetime as an aware UTC datetime (naive -> assume UTC)."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+# Sort floor for signals without a timestamp (they sort last).
+_MIN_DATETIME = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _snapshot_line(snap, label: str = "") -> str:
@@ -307,7 +324,16 @@ class PriceChart(QWidget):
     Bars come from the DB (Yahoo history: daily 2y / intraday 5d) —
     never invented. ``live_tick`` is the latest ticker quote, drawn
     as a dot at the right edge so the chart moves between refreshes.
+
+    The bar-index/price -> pixel mapping lives in ``_geometry()``
+    + ``xy()`` so SignalChart (below) draws its markers with the
+    exact same mapping — a marker sits on the right bar and the
+    right price, never an approximation of it.
     """
+
+    # Plot-area padding (px): top leaves room for the high/low
+    # label, bottom for the bars label.
+    PAD_L, PAD_R, PAD_T, PAD_B = 8, 8, 30, 22
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -324,58 +350,312 @@ class PriceChart(QWidget):
         self._live_tick = live_tick
         self.update()
 
+    def _geometry(self) -> dict | None:
+        """Plot geometry from the current bars + widget size.
+
+        None when there is nothing to plot. ``closes`` includes the
+        live tick as the last point (as the paint does); ``lo`` /
+        ``hi`` / ``span`` cover exactly those closes — a subclass
+        may widen the range (SignalChart adds its signal levels).
+        """
+        bars = self._bars
+        closes = [float(b["close"]) for b in bars]
+        if self._live_tick is not None:
+            closes.append(float(self._live_tick["value"]))
+        if not closes:
+            return None
+        lo, hi = min(closes), max(closes)
+        span = (hi - lo) or 1.0
+        width, height = self.width(), self.height()
+        return {
+            "width": width, "height": height, "closes": closes,
+            "lo": lo, "hi": hi, "span": span, "n": len(closes),
+            "pad_l": self.PAD_L, "pad_r": self.PAD_R,
+            "pad_t": self.PAD_T, "pad_b": self.PAD_B,
+            "plot_w": width - self.PAD_L - self.PAD_R,
+            "plot_h": height - self.PAD_T - self.PAD_B,
+        }
+
+    def xy(self, i: int, value: float,
+           geo: dict | None = None) -> tuple[float, float]:
+        """Pixel position of bar ``i`` at price ``value``."""
+        geo = geo if geo is not None else self._geometry()
+        if geo is None:
+            return 0.0, 0.0
+        x = geo["pad_l"] + (geo["plot_w"] * i / max(1, geo["n"] - 1))
+        y = geo["pad_t"] + geo["plot_h"] * (1.0 - (value - geo["lo"]) / geo["span"])
+        return x, y
+
+    def bar_index_for_time(self, when) -> int | None:
+        """Index of the bar in effect at ``when`` (last bar with
+        ts <= when). None when ``when`` is None or before the first
+        bar — a signal fired before the visible window is not
+        plotted on a bar it never touched."""
+        if when is None or not self._bars:
+            return None
+        when = _as_aware(when)
+        if when is None:
+            return None
+        idx = None
+        for i, bar in enumerate(self._bars):
+            ts = bar.get("ts")
+            if ts is None:
+                continue
+            ts = _as_aware(ts)
+            if ts is None:
+                continue
+            if ts <= when:
+                idx = i
+            else:
+                break
+        return idx
+
     def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        self._paint_base(painter)
+
+    def _paint_base(self, painter: QPainter) -> dict | None:
+        """Draw the gold close line + labels; returns the geometry
+        used (None when nothing to plot). SignalChart reuses this
+        and then paints its markers with the same geometry."""
         width, height = self.width(), self.height()
         # Explicit background: the fallback chart must be light in the
         # light theme (and match TradingView's dark canvas in dark).
         # A plain QWidget does not paint its own background reliably
         # from the stylesheet alone, so fill it here.
         painter.fillRect(0, 0, width, height, QColor(PALETTE["black"]))
-        bars = self._bars
-        if len(bars) < 2 and self._live_tick is None:
+        geo = self._geometry()
+        if geo is None or (len(self._bars) < 2
+                           and self._live_tick is None):
             painter.setPen(QColor(PALETTE["muted"]))
             painter.drawText(0, 0, width, height, Qt.AlignCenter,
                              "No price history yet — refresh to fetch it.")
-            return
-        closes = [float(b["close"]) for b in bars]
-        if self._live_tick is not None:
-            closes.append(float(self._live_tick["value"]))
-        lo, hi = min(closes), max(closes)
-        span = (hi - lo) or 1.0
-        pad_l, pad_r, pad_t, pad_b = 8, 8, 30, 22
-        plot_w = width - pad_l - pad_r
-        plot_h = height - pad_t - pad_b
-        n = len(closes)
-
-        def xy(i: int, v: float) -> tuple[float, float]:
-            x = pad_l + (plot_w * i / max(1, n - 1))
-            y = pad_t + plot_h * (1.0 - (v - lo) / span)
-            return x, y
-
+            return None
+        closes = geo["closes"]
+        hi, lo = geo["hi"], geo["lo"]
+        bars = self._bars
+        n = geo["n"]
         # Gold line through the closes.
         path = QPainterPath()
-        x0, y0 = xy(0, closes[0])
+        x0, y0 = self.xy(0, closes[0], geo)
         path.moveTo(x0, y0)
         for i, v in enumerate(closes[1:], start=1):
-            x, y = xy(i, v)
+            x, y = self.xy(i, v, geo)
             path.lineTo(x, y)
         painter.setPen(QPen(QColor(PALETTE["gold"]), 2))
         painter.drawPath(path)
         # Last stored point + live tick dot.
-        lx, ly = xy(n - 1, closes[-1])
+        lx, ly = self.xy(n - 1, closes[-1], geo)
         painter.setBrush(QColor(PALETTE["gold_light"]))
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(int(lx) - 4, int(ly) - 4, 8, 8)
         painter.setPen(QColor(PALETTE["muted"]))
         painter.setFont(_font(9))
         interval = bars[-1].get("interval", "1d") if bars else "—"
-        painter.drawText(pad_l, 4, 300, 12, Qt.AlignLeft,
+        painter.drawText(self.PAD_L, 4, 300, 12, Qt.AlignLeft,
                          f"high {hi:,.2f}  ·  low {lo:,.2f}")
-        painter.drawText(pad_l, height - 8, 300, 12, Qt.AlignLeft,
+        painter.drawText(self.PAD_L, height - 8, 300, 12, Qt.AlignLeft,
                          f"{len(bars)} bars ({interval})"
                          + ("  ·  LIVE" if self._live_tick else ""))
+        return geo
+
+
+class SignalChart(PriceChart):
+    """Built-in chart with Vanta's own signals plotted on it (v0.8.0).
+
+    The TradingView embed is a cross-origin iframe — NO marker or
+    drawing API exists for it. Verified against the embed script
+    served by s3.tradingview.com: its only messages are
+    iframe-resize and open-in-popup, and its settings list has no
+    marker / drawing / annotation parameter (the drawings API
+    belongs to the paid Charting Library, not the free widget). So
+    accuracy checking happens here, on the built-in chart, where
+    every pixel is ours: a buy/sell marker at the signal's bar +
+    entry price, dashed entry / SL (red) / TP (green) lines, and
+    the outcome for closed signals (TP hit / SL hit / expired,
+    with the R multiple) from the existing backtest engine. Signals
+    are advisory / shadow-only, and the status line says so.
+    """
+
+    # Latest N signals in the visible range are drawn — more would
+    # be spaghetti. The status line says how many were plotted.
+    MAX_PLOTTED = 10
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        # Entries are (Signal, TradeResult | None): the outcome comes
+        # from goldboard_core.backtest on the daily bars; None means
+        # the signal is still open (no outcome yet — never invented).
+        self._signals: list[tuple] = []
+
+    def set_signals(self, signals) -> None:
+        """Signals to plot: (Signal, TradeResult | None) pairs."""
+        self._signals = list(signals or [])
+        self.update()
+
+    def _geometry(self) -> dict | None:
+        """Base geometry, widened so every plotted signal's entry /
+        SL / TP is inside the plot (otherwise a level would fall
+        off the chart). Only in-range signals widen it."""
+        geo = super()._geometry()
+        if geo is None:
+            return None
+        levels: list[float] = []
+        for sig, _trade in self._signals:
+            if sig.direction not in ("buy", "sell"):
+                continue
+            if self.bar_index_for_time(sig.generated_at) is None:
+                continue
+            for value in (sig.entry, sig.sl, sig.tp):
+                if value is not None:
+                    levels.append(float(value))
+        if levels:
+            lo = min([geo["lo"], *levels])
+            hi = max([geo["hi"], *levels])
+            geo = dict(geo)
+            geo["lo"] = lo
+            geo["hi"] = hi
+            geo["span"] = (hi - lo) or 1.0
+        return geo
+
+    def markers(self) -> list[dict]:
+        """Markers that would be drawn now (for tests + status).
+
+        Latest first, capped at MAX_PLOTTED, only buy/sell signals
+        whose generated_at falls inside the visible bars. Each
+        marker carries the bar index, the pixel x/y of the entry,
+        entry/SL/TP, the outcome ("open" / "tp" / "sl" / "expired")
+        and the R multiple."""
+        geo = self._geometry()
+        if geo is None:
+            return []
+        ordered = sorted(
+            self._signals,
+            key=lambda pair: _as_aware(pair[0].generated_at)
+            or _MIN_DATETIME,
+            reverse=True)
+        out: list[dict] = []
+        for sig, trade in ordered:
+            if sig.direction not in ("buy", "sell"):
+                continue
+            idx = self.bar_index_for_time(sig.generated_at)
+            if idx is None:
+                continue
+            x, y = self.xy(idx, float(sig.entry), geo)
+            out.append({
+                "signal": sig, "trade": trade, "bar_index": idx,
+                "x": x, "y": y, "direction": sig.direction,
+                "entry": float(sig.entry),
+                "sl": None if sig.sl is None else float(sig.sl),
+                "tp": None if sig.tp is None else float(sig.tp),
+                "outcome": trade.outcome if trade is not None else "open",
+                "r_multiple": (trade.r_multiple
+                               if trade is not None else None),
+                "exit_at": (trade.exit_at
+                            if trade is not None else None),
+                "exit_price": (trade.exit_price
+                               if trade is not None else None),
+            })
+            if len(out) >= self.MAX_PLOTTED:
+                break
+        return out
+
+    def in_range_count(self) -> int:
+        """Buy/sell signals whose generated_at is inside the
+        visible bars (before the MAX_PLOTTED cap)."""
+        count = 0
+        for sig, _trade in self._signals:
+            if sig.direction not in ("buy", "sell"):
+                continue
+            if self.bar_index_for_time(sig.generated_at) is not None:
+                count += 1
+        return count
+
+    def paintEvent(self, event) -> None:  # noqa: D102 — Qt paint hook
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        geo = self._paint_base(painter)
+        if geo is not None:
+            self._paint_signals(painter, geo)
+
+    @staticmethod
+    def _dashed_line(painter: QPainter, x0: float, x1: float,
+                     y: float, color: QColor) -> None:
+        painter.setPen(QPen(color, 1, Qt.DashLine))
+        painter.drawLine(int(round(x0)), int(round(y)),
+                         int(round(x1)), int(round(y)))
+
+    def _paint_signals(self, painter: QPainter, geo: dict) -> None:
+        markers = self.markers()
+        if not markers:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.setFont(_font(11))
+            painter.drawText(geo["pad_l"], geo["pad_t"] + 14,
+                             "No Vanta signals in this range yet — "
+                             "signals appear here as the board runs.")
+            return
+        right = geo["pad_l"] + geo["plot_w"]
+        for marker in markers:
+            x, y = marker["x"], marker["y"]
+            buy = marker["direction"] == "buy"
+            color = QColor("#2E9E5B" if buy else "#C0392B")
+            # Dashed entry / SL / TP lines, from the signal's bar
+            # rightwards across the chart.
+            self._dashed_line(painter, x, right, y,
+                              QColor(PALETTE["gold"]))
+            if marker["sl"] is not None:
+                _sx, y_sl = self.xy(marker["bar_index"], marker["sl"], geo)
+                self._dashed_line(painter, x, right, y_sl,
+                                  QColor("#C0392B"))
+            if marker["tp"] is not None:
+                _tx, y_tp = self.xy(marker["bar_index"], marker["tp"], geo)
+                self._dashed_line(painter, x, right, y_tp,
+                                  QColor("#2E9E5B"))
+            # Marker triangle: buy points up from below the entry,
+            # sell points down from above it.
+            size = 7
+            path = QPainterPath()
+            if buy:
+                path.moveTo(x, y + 4)
+                path.lineTo(x - size, y + 4 + size)
+                path.lineTo(x + size, y + 4 + size)
+            else:
+                path.moveTo(x, y - 4)
+                path.lineTo(x - size, y - 4 - size)
+                path.lineTo(x + size, y - 4 - size)
+            path.closeSubpath()
+            painter.setBrush(color)
+            painter.setPen(Qt.NoPen)
+            painter.drawPath(path)
+            # Label: direction + entry + outcome (R multiple when
+            # closed, "open" otherwise). Clamped inside the plot.
+            outcome = marker["outcome"]
+            if outcome == "open":
+                outcome_t = "open"
+            elif marker["r_multiple"] is not None:
+                label = {"tp": "TP", "sl": "SL",
+                         "expired": "expired"}[outcome]
+                outcome_t = f"{label} {marker['r_multiple']:+.1f}R"
+            else:
+                outcome_t = outcome
+            text = (f"{'BUY' if buy else 'SELL'} "
+                    f"{marker['entry']:,.2f} · {outcome_t}")
+            painter.setFont(_font(10, bold=True))
+            painter.setPen(color)
+            text_w = painter.fontMetrics().horizontalAdvance(text)
+            text_x = min(max(x + 10, geo["pad_l"]), right - text_w)
+            text_y = (y + 4 + size + 14) if buy else (y - 4 - size - 4)
+            painter.drawText(int(text_x), int(text_y), text)
+            # Exit dot for closed signals, at the exit bar/price.
+            if marker["exit_at"] is not None \
+                    and marker["exit_price"] is not None:
+                ex = self.bar_index_for_time(marker["exit_at"])
+                if ex is not None:
+                    ex_x, ex_y = self.xy(ex, marker["exit_price"], geo)
+                    painter.setBrush(color)
+                    painter.setPen(Qt.NoPen)
+                    painter.drawEllipse(int(ex_x) - 4, int(ex_y) - 4, 8, 8)
 
 
 class VolumeProfileWidget(QWidget):
@@ -765,6 +1045,48 @@ class ChartDialog(QDialog):
         self.closed.emit()
 
 
+class TabDialog(QDialog):
+    """Expanded tab window (v0.8.0) — modeless, centred on screen.
+
+    Mirrors ChartDialog: the dashboard tabs stay small on a
+    1366x768 screen, so a tab can be opened large here. Holds the
+    SAME tab page (its QScrollArea, reparented, never copied).
+    Closing it emits ``closed`` so the MainWindow can dock the
+    page back into its tab. The tab bar stays usable while it is
+    open; switching tabs inside the dialog is out of scope — it
+    shows the tab that was expanded.
+    """
+
+    closed = Signal()
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{title} — Vanta")
+        self.setWindowFlags(Qt.Window)
+        self.setModal(False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        collapse_row = QHBoxLayout()
+        collapse_row.addStretch(1)
+        self._collapse_button = QPushButton(
+            "⛶ Collapse back to dashboard", self)
+        self._collapse_button.setProperty("class", "ghost")
+        self._collapse_button.clicked.connect(self.close)
+        collapse_row.addWidget(self._collapse_button)
+        layout.addLayout(collapse_row)
+        self._tab_layout = QVBoxLayout()
+        layout.addLayout(self._tab_layout)
+
+    @property
+    def tab_layout(self) -> QVBoxLayout:
+        """Layout the tab page is docked into."""
+        return self._tab_layout
+
+    def closeEvent(self, event) -> None:  # noqa: D102 — Qt close hook
+        super().closeEvent(event)
+        self.closed.emit()
+
+
 class MainWindow(QMainWindow):
     """Vanta main window — one screen, ten panels, black + gold."""
 
@@ -784,6 +1106,18 @@ class MainWindow(QMainWindow):
         set_theme(self._theme)
         # Expanded chart dialog (v0.7.0): None while docked in preview.
         self._chart_dialog: ChartDialog | None = None
+        # Expanded tab dialog (v0.8.0): None while docked in its tab.
+        # _expanded_tab is (tab key, tab index, tab title) while open.
+        self._tab_dialog: TabDialog | None = None
+        self._expanded_tab: tuple | None = None
+        # Chart view (v0.8.0): "tradingview" (the live embed) or
+        # "signals" (the built-in chart with Vanta's signal markers).
+        self._chart_view = "tradingview"
+        # (Signal, TradeResult | None) pairs for the markers chart —
+        # computed from the payload in _apply_payload, never invented.
+        self._signal_markers: list[tuple] = []
+        self._signals_history: list = []
+        self._signal_outcome_by_key: dict = {}
         # One-time migration: v0.1.x kept the refresh interval in
         # QSettings; v0.2.0 keeps it in the config file. A config file
         # that predates the field keeps the QSettings value.
@@ -1106,6 +1440,24 @@ class MainWindow(QMainWindow):
             self._tab_content[key] = content
             self._tab_grids[key] = grid
             self._tab_index[key] = self._tabs.addTab(scroll, title)
+        # Double-click a tab opens it large (v0.8.0) — same dialog
+        # as the "Expand tab" button below the chart.
+        self._tabs.tabBar().tabBarDoubleClicked.connect(
+            self._on_tab_double_clicked)
+        # "Expand tab" lives in the tab bar's corner (v0.8.0): a
+        # separate row above the tabs would cost them ~30px at
+        # 1366x768, and the v0.7.1 layout test holds the tabs to
+        # >= 250px there.
+        self._expand_tab_button = QPushButton("Expand tab", self._tabs)
+        self._expand_tab_button.setProperty("class", "ghost")
+        self._expand_tab_button.setProperty("compact", True)
+        self._expand_tab_button.setToolTip(
+            "Open the current tab large in a centred window "
+            "(or double-click a tab)")
+        self._expand_tab_button.clicked.connect(
+            lambda _checked=False: self._expand_tab())
+        self._tabs.setCornerWidget(self._expand_tab_button,
+                                   Qt.TopRightCorner)
 
     def _register_panel(self, key: str, box: QGroupBox,
                         wide: bool = False, tab: str | None = None,
@@ -1128,6 +1480,10 @@ class MainWindow(QMainWindow):
         any panel in it restores the tab.
         """
         for tab_key, _title in self._TAB_SPECS:
+            if tab_key not in self._tab_index:
+                # Tab page is out in the expand dialog (v0.8.0) —
+                # nothing to re-flow until it docks back.
+                continue
             grid = self._tab_grids[tab_key]
             while grid.count():
                 grid.takeAt(0)
@@ -1300,15 +1656,27 @@ class MainWindow(QMainWindow):
             cards["price"]["sub"].setText(
                 "No data yet — refresh to fetch the quote.")
 
-        # (2) Technical signal + buy/sell counts.
+        # (2) Latest advisory signal (v0.8.0): the frozen signal
+        # from the institutional score — direction pill, entry,
+        # time, confidence. The indicator counts live in the
+        # Technical panel now; the strip shows the signal itself.
+        # "none" is honest: the score is inside the ±40 band.
         tech = payload.get("technical") or {}
-        if tech.get("bars_daily"):
-            signal = str(tech.get("signal", "neutral"))
-            _set_pill(cards["technical"]["value"], signal.upper(),
-                      SIGNAL_PILL_KIND.get(signal.lower(), "grey"))
+        signal = payload.get("signal")
+        if signal is not None and signal.direction in ("buy", "sell"):
+            kind = "green" if signal.direction == "buy" else "red"
+            _set_pill(cards["technical"]["value"],
+                      signal.direction.upper(), kind)
             cards["technical"]["sub"].setText(
-                f"{tech.get('buy', 0)} buy / {tech.get('neutral', 0)} "
-                f"neutral / {tech.get('sell', 0)} sell")
+                f"@ {_fmt_value(signal.entry)} · "
+                f"{_fmt_time(signal.generated_at)} · "
+                f"conf {signal.confidence:.0%}")
+        elif signal is not None:
+            _set_pill(cards["technical"]["value"], "NO SIGNAL", "grey")
+            total = payload.get("score")
+            total_t = total.total if total is not None else 0.0
+            cards["technical"]["sub"].setText(
+                f"Score {total_t:+.1f} in ±40 band — no signal")
         else:
             _set_pill(cards["technical"]["value"], "—", "grey")
             cards["technical"]["sub"].setText(
@@ -1347,14 +1715,25 @@ class MainWindow(QMainWindow):
             cards["score"]["value"].setText("—")
             cards["score"]["sub"].setText("No score yet — no data.")
 
-        # (5) Active setups: count + top setup.
+        # (5) Active setups: count + top setup. A directional setup
+        # is the top one (v0.8.0): the event caution used to come
+        # first with direction "none", so the card read "· NONE"
+        # while real long/short setups existed below it. A caution
+        # or conflict shown on its own is named without a fake
+        # direction.
         setups = payload.get("setups") or []
         cards["setups"]["value"].setText(str(len(setups)))
         if setups:
-            top = setups[0]
-            cards["setups"]["sub"].setText(
-                f"{top.get('name', '')} · "
-                f"{str(top.get('direction', 'none')).upper()}")
+            top = next(
+                (s for s in setups
+                 if str(s.get("direction")) in ("long", "short")),
+                setups[0])
+            direction = str(top.get("direction", "none"))
+            if direction in ("long", "short"):
+                cards["setups"]["sub"].setText(
+                    f"{top.get('name', '')} · {direction.upper()}")
+            else:
+                cards["setups"]["sub"].setText(str(top.get("name", "")))
         else:
             cards["setups"]["sub"].setText(
                 "No setups yet — refresh to evaluate the rules.")
@@ -1487,7 +1866,41 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout(self._chart_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(4)
-        container_layout.addWidget(self._tv_chart)
+        # Chart view switcher (v0.8.0): TradingView is a
+        # cross-origin iframe — no marker API exists for it — so
+        # Vanta's signals are plotted on the built-in chart instead.
+        # The switcher buttons live in the merged control row below
+        # (NOT their own row: a separate row would cost the tabs
+        # ~30px at 1366x768, and the v0.7.1 layout test holds the
+        # tabs to >= 250px there).
+        self._signals_chart = SignalChart(content)
+        self._signals_chart.setMinimumHeight(PREVIEW_MIN_HEIGHT)
+        self._view_stack = QStackedWidget(content)
+        self._view_stack.addWidget(self._tv_chart)
+        self._view_stack.addWidget(self._signals_chart)
+        self._view_stack.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self._view_stack.setMinimumHeight(PREVIEW_MIN_HEIGHT)
+        self._view_buttons: dict[str, QPushButton] = {}
+        for key, label in (("tradingview", "TradingView"),
+                           ("signals", "Vanta signals")):
+            btn = QPushButton(label, content)
+            btn.setProperty("class", "ghost")
+            btn.setProperty("compact", True)
+            btn.setCheckable(True)
+            btn.setChecked(key == self._chart_view)
+            btn.setToolTip(
+                "TradingView: the live chart. Vanta signals: the "
+                "built-in chart with Vanta's buy/sell markers + "
+                "SL/TP, so accuracy can be checked.")
+            btn.clicked.connect(
+                lambda _checked=False, k=key: self._set_chart_view(k))
+            self._view_buttons[key] = btn
+        # Into the merged control row, ahead of the status label —
+        # the row travels into the expand dialog with the chart.
+        for i, key in enumerate(("tradingview", "signals")):
+            merged_row.insertWidget(i, self._view_buttons[key])
+        container_layout.addWidget(self._view_stack)
         container_layout.addLayout(merged_row)
         # Placeholder shown in the preview while the chart is expanded.
         self._chart_placeholder = QWidget(content)
@@ -1900,6 +2313,28 @@ class MainWindow(QMainWindow):
             btn.setChecked(label == range_label)
         self._refresh_chart()
 
+    def _set_chart_view(self, view: str) -> None:
+        """Flip between the live TradingView chart and the Vanta
+        signals chart (same bars, same range buttons)."""
+        if view not in ("tradingview", "signals"):
+            return
+        self._chart_view = view
+        for key, btn in self._view_buttons.items():
+            btn.setChecked(key == view)
+        self._view_stack.setCurrentIndex(
+            0 if view == "tradingview" else 1)
+        self._update_chart_status()
+        if view == "signals":
+            self._refresh_chart()
+
+    def _set_chart_min_height(self, height: int) -> None:
+        """Preview (200px) / expanded (480px) height for the chart
+        area: the TradingView stack, the signals chart, and the view
+        stack that holds them all move together."""
+        self._tv_chart.set_min_height(height)
+        self._signals_chart.setMinimumHeight(height)
+        self._view_stack.setMinimumHeight(height)
+
     def _refresh_chart(self) -> None:
         if self._chart_range in ("1D", "5D"):
             bars = self._chart_bars_intraday
@@ -1909,10 +2344,27 @@ class MainWindow(QMainWindow):
             count = {"1M": 22, "1Y": 250, "2Y": 500}[self._chart_range]
             bars = self._chart_bars_daily[-count:]
         self._price_chart.set_bars(bars, self._live_tick)
+        # The signals chart shows the same bars + Vanta's signals.
+        self._signals_chart.set_bars(bars, self._live_tick)
+        self._signals_chart.set_signals(self._signal_markers)
 
     def _update_chart_status(self, live: bool | None = None) -> None:
         """Status line under the chart: TradingView LIVE (green) or
-        the built-in fallback (amber) with a Retry button."""
+        the built-in fallback (amber) with a Retry button — or, in
+        the Vanta signals view, how many signals are plotted."""
+        if self._chart_view == "signals":
+            plotted = self._signals_chart.markers()
+            in_range = self._signals_chart.in_range_count()
+            total = len(self._signal_markers)
+            self._chart_status.setText(
+                f"Vanta signals — {len(plotted)} plotted "
+                f"(latest {SignalChart.MAX_PLOTTED} of {in_range} in "
+                f"range, {total} stored) · SL red / TP green · "
+                "advisory only, shadow mode")
+            self._chart_status.setStyleSheet(
+                f"color: {PALETTE['muted']};")
+            self._chart_retry_button.setVisible(False)
+            return
         if live is None:
             live = self._tv_chart.is_live
         if live:
@@ -1950,11 +2402,15 @@ class MainWindow(QMainWindow):
             page = self._tv_chart.widget(i)
             if page is not None:
                 page.installEventFilter(self)
+        self._signals_chart.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: D102 — Qt hook
         if (self._chart_dialog is None
                 and event.type() == QEvent.MouseButtonPress
                 and event.button() == Qt.LeftButton):
+            if watched is self._signals_chart:
+                self._expand_chart()
+                return True
             for i in range(self._tv_chart.count()):
                 if watched is self._tv_chart.widget(i):
                     # A click on the preview opens the big window; the
@@ -1982,7 +2438,12 @@ class MainWindow(QMainWindow):
         # The SAME chart widget moves — a QWebEngineView cannot live
         # in two places, so it is never duplicated.
         dialog.chart_layout.addWidget(self._chart_container)
-        self._tv_chart.set_min_height(CHART_MIN_HEIGHT)
+        # Defensive: the container must be visibly shown in its new
+        # home (the tab dialog needed the same explicit show() —
+        # removeTab hides the page and the hidden dialog never
+        # showed it back, so the dialog opened black).
+        self._chart_container.show()
+        self._set_chart_min_height(CHART_MIN_HEIGHT)
         self._chart_placeholder.setVisible(True)
         self._expand_button.setEnabled(False)
         self._chart_dialog = dialog
@@ -2002,7 +2463,7 @@ class MainWindow(QMainWindow):
         layout = self._price_layout
         layout.insertWidget(layout.indexOf(self._chart_placeholder),
                             self._chart_container)
-        self._tv_chart.set_min_height(PREVIEW_MIN_HEIGHT)
+        self._set_chart_min_height(PREVIEW_MIN_HEIGHT)
         self._chart_placeholder.setVisible(False)
         self._expand_button.setEnabled(True)
 
@@ -2011,6 +2472,109 @@ class MainWindow(QMainWindow):
         docks the chart back — one code path, no reentrancy)."""
         if self._chart_dialog is not None:
             self._chart_dialog.close()
+
+    # --------------------------------------------------- tab expand / dock
+
+    def _on_tab_double_clicked(self, index: int) -> None:
+        """Double-click on a tab bar opens that tab large."""
+        if index < 0 or self._tab_dialog is not None:
+            return
+        for key, tab_index in self._tab_index.items():
+            if tab_index == index:
+                self._expand_tab(key)
+                return
+
+    def _expand_tab(self, key: str | None = None) -> None:
+        """Move the current tab's page into a centred modeless
+        dialog (same QScrollArea, reparented, never copied)."""
+        if self._tab_dialog is not None:
+            self._tab_dialog.raise_()
+            self._tab_dialog.activateWindow()
+            return
+        if key is None:
+            current = self._tabs.currentWidget()
+            key = next((k for k, scroll in self._tab_pages.items()
+                        if scroll is current), None)
+        if key is None or key not in self._tab_pages:
+            return
+        scroll = self._tab_pages[key]
+        index = self._tabs.indexOf(scroll)
+        if index < 0:
+            return
+        title = self._tabs.tabText(index)
+        dialog = TabDialog(title, self)
+        dialog.setStyleSheet(self._stylesheet())
+        dialog.closed.connect(self._on_tab_dialog_closed)
+        screen = QApplication.primaryScreen().availableGeometry()
+        width = min(1150, max(400, screen.width() - 40))
+        height = min(720, max(300, screen.height() - 40))
+        x = screen.x() + (screen.width() - width) // 2
+        y = screen.y() + (screen.height() - height) // 2
+        dialog.setGeometry(x, y, width, height)
+        self._tabs.removeTab(index)
+        dialog.tab_layout.addWidget(scroll)
+        # removeTab hides the page (QStackedWidget::removeWidget)
+        # and the dialog was still hidden when the page moved, so
+        # the layout never showed it: without this the dialog
+        # opens with an empty black area and only its Collapse
+        # button visible.
+        scroll.show()
+        self._expanded_tab = (key, index, title)
+        self._refresh_tab_index()
+        self._expand_tab_button.setEnabled(False)
+        self._tab_dialog = dialog
+        dialog.show()
+        self.log(f"Tab '{title}' expanded to a centred window.")
+
+    def _on_tab_dialog_closed(self) -> None:
+        """Dialog closed (X or Collapse): dock the page back into
+        its tab, at the same position and title."""
+        dialog = self._tab_dialog
+        expanded = self._expanded_tab
+        self._tab_dialog = None
+        self._expanded_tab = None
+        if dialog is not None and expanded is not None:
+            key, index, title = expanded
+            scroll = self._tab_pages[key]
+            dialog.tab_layout.removeWidget(scroll)
+            self._tabs.insertTab(index, scroll, title)
+            self._tabs.setCurrentIndex(index)
+        self._refresh_tab_index()
+        self._expand_tab_button.setEnabled(True)
+
+    def _refresh_tab_index(self) -> None:
+        """Rebuild key -> tab index from the live tab widget.
+
+        Indices shift when a tab page is removed/inserted for the
+        expand dialog; the expanded tab has no index while it is
+        out (its panels cannot be hidden from the menu meanwhile —
+        _relayout_panels skips it)."""
+        self._tab_index = {}
+        for key, scroll in self._tab_pages.items():
+            index = self._tabs.indexOf(scroll)
+            if index >= 0:
+                self._tab_index[key] = index
+
+    def _collapse_tab(self) -> None:
+        """Close the tab dialog (its closeEvent docks the page
+        back — one code path, no reentrancy)."""
+        if self._tab_dialog is not None:
+            self._tab_dialog.close()
+
+    def _outcome_text(self, signal) -> str:
+        """Outcome of one stored signal, from the frozen backtest
+        engine (computed in _apply_payload): "open" while it has
+        none, else "TP hit +2.0R" / "SL hit −1.0R" / "expired +0.3R".
+        Never invented — no TradeResult means still open."""
+        trade = self._signal_outcome_by_key.get(
+            (signal.direction, signal.entry, signal.generated_at))
+        if trade is None:
+            return "open"
+        label = {"tp": "TP hit", "sl": "SL hit",
+                 "expired": "expired"}.get(trade.outcome, trade.outcome)
+        if trade.r_multiple is not None:
+            return f"{label} {trade.r_multiple:+.1f}R"
+        return label
 
     # -------------------------------------------------------------- news
 
@@ -2122,6 +2686,27 @@ class MainWindow(QMainWindow):
         # Live chart from stored OHLC bars.
         self._chart_bars_daily = payload.get("price_bars_daily", []) or []
         self._chart_bars_intraday = payload.get("price_bars_intraday", []) or []
+        # Signal outcomes for the markers chart + Signals panel
+        # (v0.8.0): the frozen backtest engine evaluates the stored
+        # signals on the daily bars. A signal with no TradeResult
+        # is still open — its outcome is never invented. Display
+        # only; no scoring/signal rule is touched.
+        self._signals_history = list(
+            payload.get("signals_history", []) or [])
+        self._signal_outcome_by_key: dict = {}
+        try:
+            prices = [(b["ts"], b["close"], b["high"], b["low"])
+                      for b in self._chart_bars_daily]
+            result = backtest(self._signals_history, prices)
+            for trade in result.trades:
+                key = (trade.direction, trade.entry, trade.generated_at)
+                self._signal_outcome_by_key[key] = trade
+        except Exception:
+            self._signal_outcome_by_key = {}
+        self._signal_markers = [
+            (sig, self._signal_outcome_by_key.get(
+                (sig.direction, sig.entry, sig.generated_at)))
+            for sig in self._signals_history]
         self._refresh_chart()
 
         # (2) Score + components.
@@ -2248,7 +2833,9 @@ class MainWindow(QMainWindow):
         for past in payload.get("signals_history", [])[:20]:
             self._signal_list.addItem(QListWidgetItem(
                 f"{_fmt_time(past.generated_at)} — {past.direction.upper()} @ "
-                f"{_fmt_value(past.entry)} · {past.status} · {past.reason}"))
+                f"{_fmt_value(past.entry)} · SL {_fmt_value(past.sl)} · "
+                f"TP {_fmt_value(past.tp)} · "
+                f"{self._outcome_text(past)} · {past.reason}"))
 
         # (9) Gates.
         gates = payload.get("gates", [])
@@ -2563,6 +3150,10 @@ class MainWindow(QMainWindow):
         # the chart container into the preview (no dangling widget).
         if self._chart_dialog is not None:
             self._chart_dialog.close()
+        # Same for the expanded tab dialog (v0.8.0): closing it
+        # docks the tab page back into its tab.
+        if self._tab_dialog is not None:
+            self._tab_dialog.close()
         self._clock_timer.stop()
         self._refresh_timer.stop()
         # Stop the startup timers first: a pending refresh/update/ticker

@@ -112,12 +112,14 @@ def test_strip_updates_from_payload(tmp_path, monkeypatch, qapp):
     assert "4,000" in cards["price"]["value"].text()
     assert "price" in cards["price"]["sub"].text().lower() \
         or "Yahoo" in cards["price"]["sub"].text()
-    # Technical: rising bars -> buy signal with counts.
-    tech = payload["technical"]
-    assert tech["signal"] in ("buy", "strong buy")
-    assert cards["technical"]["value"].text() == tech["signal"].upper()
-    assert f"{tech['buy']} buy" in cards["technical"]["sub"].text()
+    # Technical: the strip card shows the LATEST advisory signal,
+    # not the indicator counts (those live in the Technical panel).
+    # Here the score (+22) is inside the ±40 band, so honestly no
+    # signal — the pill says so instead of showing a stale one.
+    assert cards["technical"]["value"].text() == "NO SIGNAL"
+    assert "±40 band" in cards["technical"]["sub"].text()
     # Regime filter: label + ER/CHOP shown.
+    tech = payload["technical"]
     rf = tech["regime_filter"]
     assert cards["regime"]["value"].text() == rf["label"].upper()
     assert "ER" in cards["regime"]["sub"].text()
@@ -129,10 +131,16 @@ def test_strip_updates_from_payload(tmp_path, monkeypatch, qapp):
     assert "cot" in cards["score"]["sub"].text()
     # Honest pillar count: the seed fills all five pillars.
     assert "5 of 5 pillars" in cards["score"]["sub"].text()
-    # Setups: count + top setup name.
+    # Setups: count + top setup. The top setup is a DIRECTIONAL
+    # one (v0.8.0): the event caution fires first in the list with
+    # direction "none", so the old card read "· NONE" while real
+    # long/short setups existed below it.
     assert cards["setups"]["value"].text() == str(len(payload["setups"]))
-    if payload["setups"]:
-        assert payload["setups"][0]["name"] in cards["setups"]["sub"].text()
+    directional = [s for s in payload["setups"]
+                   if s["direction"] in ("long", "short")]
+    assert directional, "fixture should have a directional setup"
+    assert directional[0]["name"] in cards["setups"]["sub"].text()
+    assert "NONE" not in cards["setups"]["sub"].text()
     # Next macro event: bundled calendar has PCE / jobs / FOMC.
     assert payload["events"], "bundled calendar should list events"
     assert payload["events"][0]["name"] in cards["event"]["value"].text()
@@ -145,6 +153,57 @@ def test_strip_updates_from_payload(tmp_path, monkeypatch, qapp):
     # Technical panel pills mirror the strip.
     assert window._tech_signal_pill.text() == tech["signal"].upper()
     assert window._tech_regime_pill.text() == rf["label"].upper()
+    window.close()
+
+
+def test_strip_shows_latest_buy_signal(tmp_path, monkeypatch, qapp):
+    """v0.8.0: the Technical card shows the LATEST advisory signal
+    prominently — direction pill, entry, time, confidence."""
+    from datetime import datetime, timezone
+
+    from goldboard_core.models import Signal
+
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    signal = Signal(
+        direction="buy", entry=4000.0, sl=3950.0, tp=4100.0,
+        confidence=0.86, reason="Score +60: test.",
+        generated_at=datetime(2026, 11, 24, 11, 0, tzinfo=timezone.utc),
+        rule_version="v0.1.0", horizon_days=10, status="open")
+    payload = {"price": None, "technical": {}, "score": None,
+               "signal": signal, "setups": [], "events": [],
+               "volume_profile": {}}
+    window._update_summary_strip(payload)
+    qapp.processEvents()
+    cards = window._strip_cards
+    assert cards["technical"]["value"].text() == "BUY"
+    sub = cards["technical"]["sub"].text()
+    assert "4,000" in sub
+    assert "86%" in sub
+    assert "11:00" in sub
+    window.close()
+
+
+def test_strip_no_signal_is_honest_not_stale(tmp_path, monkeypatch, qapp):
+    """v0.8.0: a "none" signal shows NO SIGNAL with the score band
+    — never a stale buy/sell from an earlier refresh."""
+    from datetime import datetime, timezone
+
+    from goldboard_core.models import Signal
+
+    window = _open_window(tmp_path, monkeypatch, qapp)
+    signal = Signal(
+        direction="none", entry=4000.0, sl=None, tp=None,
+        confidence=0.0, reason="Score +22: inside band.",
+        generated_at=datetime(2026, 11, 24, 11, 0, tzinfo=timezone.utc),
+        rule_version="v0.1.0", horizon_days=10, status="open")
+    payload = {"price": None, "technical": {}, "score": None,
+               "signal": signal, "setups": [], "events": [],
+               "volume_profile": {}}
+    window._update_summary_strip(payload)
+    qapp.processEvents()
+    cards = window._strip_cards
+    assert cards["technical"]["value"].text() == "NO SIGNAL"
+    assert "±40 band" in cards["technical"]["sub"].text()
     window.close()
 
 

@@ -15,7 +15,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -86,16 +86,61 @@ def seed_demo_db(db_path: Path) -> None:
             value=float(value), unit="contracts",
             as_of=NOW, fetched_at=NOW, status="ok",
             source_url="https://example.invalid/cftc"))
+    # Price bars + Vanta signals (v0.8.0): the markers screenshot
+    # needs real bars and real stored signals to plot. Rising daily
+    # bars (250d from 2025-01-01) + intraday bars, and two signals
+    # whose outcomes the backtest engine can already tell: a buy
+    # on day 150 (TP +30 at 2R hits on day 10) and a sell on day
+    # 220 (SL +30 hits on day 10). Demo data — screenshot only.
+    from goldboard_core.models import Signal
+    from goldboard_core.storage import save_price_bars, save_signal
+
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    price = 3000.0
+    bars = []
+    for i in range(250):
+        price += 3.0
+        bars.append({"ts": base + timedelta(days=i),
+                     "open": price - 0.5, "high": price + 1.0,
+                     "low": price - 1.0, "close": price, "volume": None,
+                     "interval": "1d"})
+    save_price_bars(db_path, bars)
+    intra = []
+    for i in range(96):
+        p = 3500.0 + (i % 10)
+        intra.append({"ts": base + timedelta(minutes=15 * i),
+                      "open": p, "high": p + 2.0, "low": p - 2.0,
+                      "close": p, "volume": 10.0 if i % 2 else 1.0,
+                      "interval": "15m"})
+    save_price_bars(db_path, intra)
+    buy_bar = bars[150]
+    save_signal(db_path, Signal(
+        direction="buy", entry=buy_bar["close"],
+        sl=buy_bar["close"] - 15, tp=buy_bar["close"] + 30,
+        confidence=0.86, reason="Demo signal for the markers screenshot.",
+        generated_at=buy_bar["ts"] + timedelta(hours=12),
+        rule_version="v0.1.0", horizon_days=10, status="open"))
+    sell_bar = bars[220]
+    save_signal(db_path, Signal(
+        direction="sell", entry=sell_bar["close"],
+        sl=sell_bar["close"] + 30, tp=sell_bar["close"] - 60,
+        confidence=0.82, reason="Demo signal for the markers screenshot.",
+        generated_at=sell_bar["ts"] + timedelta(hours=12),
+        rule_version="v0.1.0", horizon_days=10, status="open"))
 
 
 def main() -> int:
     """Usage: python scripts/screenshot.py [--theme dark|light]
-    [--size WxH]. Default size is 1400x950; --size 1366x768 is the
-    user's screen (v0.7.1 layout check)."""
+    [--size WxH] [--view=tradingview|signals] [--range=2Y]
+    [--expand-tab=<key>]. Default size is 1400x950; --size 1366x768
+    is the user's screen (v0.7.1 layout check)."""
     args = sys.argv[1:]
     theme = "light" if "light" in args else "dark"
     out = OUT_LIGHT if theme == "light" else OUT_DARK
     width, height = 1400, 950
+    view = "tradingview"
+    chart_range = None
+    expand_tab = None
     for arg in args:
         if arg.startswith("--size="):
             try:
@@ -105,8 +150,24 @@ def main() -> int:
                 print("ERROR: --size must be WxH, e.g. --size=1366x768",
                       file=sys.stderr)
                 return 2
-    if (width, height) != (1400, 950):
-        suffix = "-light" if theme == "light" else ""
+        elif arg.startswith("--view="):
+            view = arg.split("=", 1)[1]
+            if view not in ("tradingview", "signals"):
+                print("ERROR: --view must be tradingview|signals",
+                      file=sys.stderr)
+                return 2
+        elif arg.startswith("--range="):
+            chart_range = arg.split("=", 1)[1]
+        elif arg.startswith("--expand-tab="):
+            expand_tab = arg.split("=", 1)[1]
+    suffix = "-light" if theme == "light" else ""
+    if expand_tab:
+        out = out.with_name(
+            f"screenshot-tab-{expand_tab}-{width}x{height}{suffix}.png")
+    elif view == "signals":
+        out = out.with_name(
+            f"screenshot-dashboard-{width}x{height}-signals{suffix}.png")
+    elif (width, height) != (1400, 950):
         out = out.with_name(
             f"screenshot-dashboard-{width}x{height}{suffix}.png")
     # No network during the screenshot: the background refresh is stubbed
@@ -135,7 +196,27 @@ def main() -> int:
         QTimer.singleShot(2500, loop.quit)
         loop.exec()
         app.processEvents()
-        pixmap = window.grab()
+        # Switch to the requested chart view / range / expanded tab
+        # (v0.8.0) after the startup refresh has applied its payload.
+        target = window
+        if chart_range:
+            window._set_chart_range(chart_range)
+        if view == "signals":
+            window._set_chart_view("signals")
+        if expand_tab:
+            window._expand_tab(expand_tab)
+            app.processEvents()
+            if window._tab_dialog is not None:
+                target = window._tab_dialog
+                # The dialog is a separate top-level window: give
+                # it a real paint pass before grabbing, or the grab
+                # comes back black (its content has not laid out).
+                loop = QEventLoop()
+                QTimer.singleShot(1000, loop.quit)
+                loop.exec()
+                app.processEvents()
+        app.processEvents()
+        pixmap = target.grab()
         out.parent.mkdir(parents=True, exist_ok=True)
         if pixmap.isNull() or not pixmap.save(str(out), "PNG"):
             print("ERROR: screenshot grab failed (null pixmap)", file=sys.stderr)

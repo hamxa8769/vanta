@@ -98,9 +98,13 @@ def test_expand_button_opens_centred_modeless_dialog(
     assert dialog.isVisible()
     assert dialog.isModal() is False
     assert dialog.windowTitle().startswith("Gold price")
-    # The same widget moved, not a copy.
+    # The same widget moved, not a copy — and it is VISIBLE in the
+    # dialog (the tab dialog opened black until its page got an
+    # explicit show(); the chart container gets the same guard).
     assert chart.parent() is not None
     assert dialog.chart_layout.indexOf(window._chart_container) >= 0
+    assert window._chart_container.isVisible()
+    assert window._chart_container.geometry().height() > 200
     # Centred within the screen's available geometry.
     screen = QApplication.primaryScreen().availableGeometry()
     assert dialog.geometry().center() == screen.center()
