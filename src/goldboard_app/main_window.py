@@ -2445,12 +2445,15 @@ class MainWindow(QMainWindow):
         # content's minimum can exceed the computed size, and Qt then
         # grows the dialog after show() while keeping its top-left —
         # leaving it off-centre (Windows CI: centre 38px right of
-        # the screen centre). Activate the layout first so
-        # minimumWidth/Height are real.
+        # the screen centre). Use minimumSizeHint(), which is the
+        # layout's total minimum size — NOT minimumWidth/Height,
+        # which only return an explicitly set minimum (0 here) and
+        # under-read by ~40px, so the dialog still grew after show.
+        # Activate the layout first so the hint is real.
         dialog.layout().activate()
-        width = min(max(width, dialog.minimumWidth()), screen.width())
-        height = min(max(height, dialog.minimumHeight()),
-                     screen.height())
+        hint = dialog.minimumSizeHint()
+        width = min(max(width, hint.width()), screen.width())
+        height = min(max(height, hint.height()), screen.height())
         x = screen.x() + (screen.width() - width) // 2
         y = screen.y() + (screen.height() - height) // 2
         dialog.setGeometry(x, y, width, height)
@@ -2530,12 +2533,14 @@ class MainWindow(QMainWindow):
         # chart dialog: the content's minimum can exceed the
         # computed size on a small screen, and Qt grows the dialog
         # after show() while keeping its top-left, leaving it
-        # off-centre). Activate the layout first so the minimum
-        # size is real.
+        # off-centre). Use minimumSizeHint() — the layout's total
+        # minimum — not minimumWidth/Height, which only return an
+        # explicitly set minimum (0 here). Activate the layout
+        # first so the hint is real.
         dialog.layout().activate()
-        width = min(max(width, dialog.minimumWidth()), screen.width())
-        height = min(max(height, dialog.minimumHeight()),
-                     screen.height())
+        hint = dialog.minimumSizeHint()
+        width = min(max(width, hint.width()), screen.width())
+        height = min(max(height, hint.height()), screen.height())
         x = screen.x() + (screen.width() - width) // 2
         y = screen.y() + (screen.height() - height) // 2
         dialog.setGeometry(x, y, width, height)
