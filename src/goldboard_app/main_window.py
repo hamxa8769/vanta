@@ -2432,9 +2432,6 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen().availableGeometry()
         width = min(1150, max(400, screen.width() - 40))
         height = min(720, max(300, screen.height() - 40))
-        x = screen.x() + (screen.width() - width) // 2
-        y = screen.y() + (screen.height() - height) // 2
-        dialog.setGeometry(x, y, width, height)
         # The SAME chart widget moves — a QWebEngineView cannot live
         # in two places, so it is never duplicated.
         dialog.chart_layout.addWidget(self._chart_container)
@@ -2444,6 +2441,19 @@ class MainWindow(QMainWindow):
         # showed it back, so the dialog opened black).
         self._chart_container.show()
         self._set_chart_min_height(CHART_MIN_HEIGHT)
+        # Size + centre from the ACTUAL size: on a small screen the
+        # content's minimum can exceed the computed size, and Qt then
+        # grows the dialog after show() while keeping its top-left —
+        # leaving it off-centre (Windows CI: centre 38px right of
+        # the screen centre). Activate the layout first so
+        # minimumWidth/Height are real.
+        dialog.layout().activate()
+        width = min(max(width, dialog.minimumWidth()), screen.width())
+        height = min(max(height, dialog.minimumHeight()),
+                     screen.height())
+        x = screen.x() + (screen.width() - width) // 2
+        y = screen.y() + (screen.height() - height) // 2
+        dialog.setGeometry(x, y, width, height)
         self._chart_placeholder.setVisible(True)
         self._expand_button.setEnabled(False)
         self._chart_dialog = dialog
@@ -2508,9 +2518,6 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen().availableGeometry()
         width = min(1150, max(400, screen.width() - 40))
         height = min(720, max(300, screen.height() - 40))
-        x = screen.x() + (screen.width() - width) // 2
-        y = screen.y() + (screen.height() - height) // 2
-        dialog.setGeometry(x, y, width, height)
         self._tabs.removeTab(index)
         dialog.tab_layout.addWidget(scroll)
         # removeTab hides the page (QStackedWidget::removeWidget)
@@ -2519,6 +2526,19 @@ class MainWindow(QMainWindow):
         # opens with an empty black area and only its Collapse
         # button visible.
         scroll.show()
+        # Size + centre from the ACTUAL size (same reason as the
+        # chart dialog: the content's minimum can exceed the
+        # computed size on a small screen, and Qt grows the dialog
+        # after show() while keeping its top-left, leaving it
+        # off-centre). Activate the layout first so the minimum
+        # size is real.
+        dialog.layout().activate()
+        width = min(max(width, dialog.minimumWidth()), screen.width())
+        height = min(max(height, dialog.minimumHeight()),
+                     screen.height())
+        x = screen.x() + (screen.width() - width) // 2
+        y = screen.y() + (screen.height() - height) // 2
+        dialog.setGeometry(x, y, width, height)
         self._expanded_tab = (key, index, title)
         self._refresh_tab_index()
         self._expand_tab_button.setEnabled(False)
